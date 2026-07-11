@@ -1,0 +1,10 @@
+{
+  "local_llm": {
+    "api_url": "http://localhost:1234/v1",
+    "model_name": "qwen2.5-coder-7b-instruct",
+    "timeout": 120
+  },
+  "hotkeys": {
+    "capture_code": "ctrl+shift+x"
+  }
+}
