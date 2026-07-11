@@ -1,231 +1,224 @@
 import sys
 import os
-import time
-import ctypes
-from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QHBoxLayout
-import keyboard
-
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QPushButton, QLabel, QLineEdit, QTreeWidget, QTreeWidgetItem
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from core.configurator import ConfiguratorBridge
 from core.router import AIRouter
 
-# Константы WinAPI для эмуляции вставки кода
-KEYEVENTF_KEYUP = 0x0002
-VK_CONTROL = 0x11
-VK_V = 0x56
-
 class AIWorker(QThread):
-    """Фоновый поток для отправки запросов к ИИ, чтобы GUI не зависал"""
-    result_ready = pyqtSignal(dict)
+    result_ready = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, router, query, code, window_title):
+    def __init__(self, router, query, code, window_title, metadata_item=""):
         super().__init__()
         self.router = router
         self.query = query
         self.code = code
         self.window_title = window_title
+        self.metadata_item = metadata_item
 
     def run(self):
         try:
-            result = self.router.route_request(self.query, self.code, self.window_title)
+            result = self.router.route_request(self.query, self.code, self.window_title, self.metadata_item)
             self.result_ready.emit(result)
         except Exception as e:
             self.error_occurred.emit(str(e))
 
-
-class MainAIDockApp(QWidget):
+class MainAIDockApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.captured_code = ""
-        self.last_ai_response = ""  # Хранилище для кода от ИИ (для авто-вставки)
-        self.current_window_title = ""  # Точный заголовок окна 1С
+        print("[GUI] Запуск интерфейса 1С AI DOCK v2.0 с интерактивным деревом...")
         
-        # Инициализация ядра
+        # Инфраструктура
         self.bridge = ConfiguratorBridge()
         self.router = AIRouter()
         
-        self.bridge.code_captured.connect(self.on_code_captured)
+        # Хранилище контекста
+        self.current_window_title = ""
+        self.selected_metadata_string = "" # Хранит выбранный кликом реквизит
         
+        # Инициализация интерфейса
         self.init_ui()
-        self.setup_hotkeys()
         
+        # Подписка на сигналы WinAPI моста
+        self.bridge.code_captured.connect(self.on_code_captured)
+
     def init_ui(self):
-        self.setWindowTitle("1С AI Dock v2.0")
-        self.resize(450, 600)
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
-        
-        layout = QVBoxLayout()
-        
-        self.status_label = QLabel("Статус: Готов к работе")
-        self.status_label.setStyleSheet("color: green; font-weight: bold;")
-        layout.addWidget(self.status_label)
-        
-        self.code_preview = QTextEdit()
-        self.code_preview.setPlaceholderText("Здесь появится код, выделенный в Конфигураторе...")
-        self.code_preview.setMaximumHeight(100)
-        self.code_preview.setStyleSheet("background-color: #f5f5f5; font-family: Consolas;")
-        layout.addWidget(QLabel("Контекст кода 1С:"))
-        layout.addWidget(self.code_preview)
-        
-        self.chat_area = QTextEdit()
-        self.chat_area.setReadOnly(True)
-        self.chat_area.setStyleSheet("background-color: #ffffff; font-size: 12px;")
-        layout.addWidget(QLabel("История диалога / Метаданные:"))
-        layout.addWidget(self.chat_area)
-        
-        self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Введите ваш вопрос здесь...")
-        self.input_field.returnPressed.connect(self.process_input)
-        layout.addWidget(self.input_field)
-        
-        # Блок кнопок управления
+        self.setWindowTitle("1C AI Dock v2.0 (IDE Mode)")
+        self.resize(500, 700)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Статус-бар сверху
+        self.status_label = QLabel("Статус: Ожидание...")
+        self.status_label.setStyleSheet("color: #7b1fa2; font-weight: bold;")
+        main_layout.addWidget(self.status_label)
+
+        # Область захваченного BSL-кода
+        main_layout.addWidget(QLabel("Контекст захваченного кода BSL:"))
+        self.code_area = QTextEdit()
+        self.code_area.setPlaceholderText("Здесь появится код из Конфигуратора...")
+        self.code_area.setStyleSheet("background-color: #fafafa; font-family: Consolas; font-size: 10pt;")
+        self.code_area.setMaximumHeight(150) # Ограничим по высоте, чтобы уступить место дереву
+        main_layout.addWidget(self.code_area)
+
+        # Графическое дерево метаданных (Вместо старого текстового поля)
+        main_layout.addWidget(QLabel("🌳 Живая структура метаданных (Кликабельная):"))
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setColumnCount(2)
+        self.tree_widget.setHeaderLabels(["Имя реквизита / Объекта", "Тип данных"])
+        self.tree_widget.setStyleSheet("background-color: #ffffff; font-size: 9pt;")
+        self.tree_widget.itemClicked.connect(self.on_tree_item_clicked) # Слот клика мышкой!
+        main_layout.addWidget(self.tree_widget)
+
+        # Окно ответов ИИ
+        main_layout.addWidget(QLabel("🤖 Анализ и решения ИИ:"))
+        self.output_area = QTextEdit()
+        self.output_area.setReadOnly(True)
+        self.output_area.setStyleSheet("background-color: #f4f5f7; font-family: Consolas; font-size: 10pt;")
+        self.output_area.setMaximumHeight(200)
+        main_layout.addWidget(self.output_area)
+
+        # Поле ввода вопроса разработчика
+        self.query_input = QLineEdit()
+        self.query_input.setPlaceholderText("Введите вопрос (например: Как заполнить этот реквизит?) и кликните по дереву...")
+        main_layout.addWidget(self.query_input)
+
+        # Панель кнопок управления
         btn_layout = QHBoxLayout()
         
-        self.send_btn = QPushButton("🚀 Выполнить")
-        self.send_btn.clicked.connect(self.process_input)
-        btn_layout.addWidget(self.send_btn)
-
-        self.tree_btn = QPushButton("🌳 Структура")
-        self.tree_btn.setStyleSheet("background-color: #673ab7; color: white; font-weight: bold;")
+        self.run_btn = QPushButton("🚀 Выполнить")
+        self.run_btn.setStyleSheet("background-color: #1e88e5; color: white; font-weight: bold; padding: 6px;")
+        self.run_btn.clicked.connect(self.start_ai_generation)
+        
+        self.tree_btn = QPushButton("🔄 Загрузить Структуру")
+        self.tree_btn.setStyleSheet("background-color: #7b1fa2; color: white; font-weight: bold; padding: 6px;")
         self.tree_btn.clicked.connect(self.show_metadata_tree)
-        btn_layout.addWidget(self.tree_btn)
         
-        self.paste_btn = QPushButton("📋 Вставить в 1С")
-        self.paste_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold;")
+        self.paste_btn = QPushButton("📥 Вставить в 1С")
+        self.paste_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 6px;")
         self.paste_btn.clicked.connect(self.paste_code_to_1c)
+        
+        btn_layout.addWidget(self.run_btn)
+        btn_layout.addWidget(self.tree_btn)
         btn_layout.addWidget(self.paste_btn)
-        
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
-        
-    def setup_hotkeys(self):
-        hotkey = "ctrl+shift+x"
-        try:
-            keyboard.add_hotkey(hotkey, self.trigger_capture)
-            self.status_label.setText(f"Статус: Нажмите {hotkey.upper()} в Конфигураторе")
-        except Exception as e:
-            self.status_label.setText(f"Ошибка хоткея: {e}")
+        main_layout.addLayout(btn_layout)
 
     def trigger_capture(self):
+        self.status_label.setText("Статус: Захват кода...")
         self.bridge.capture_selected_text()
+        title = self.bridge.get_active_window_title()
+        self.current_window_title = title
+        QApplication.clipboard().dataChanged.connect(self.read_clipboard_safely)
 
-    @pyqtSlot(str, str)
-    def on_code_captured(self, dummy_text, window_title):
-        self.raise_()
-        self.activateWindow()
-        time.sleep(0.12)
-        
+    def read_clipboard_safely(self):
+        try:
+            QApplication.clipboard().dataChanged.disconnect(self.read_clipboard_safely)
+            text = QApplication.clipboard().text()
+            if text:
+                self.bridge.code_captured.emit(text, self.current_window_title)
+        except Exception:
+            pass
+
+    def on_code_captured(self, code_text, window_title):
+        self.code_area.setText(code_text)
         self.current_window_title = window_title
-        clipboard = QApplication.clipboard()
-        self.captured_code = clipboard.text()
-        
-        if self.captured_code.strip():
-            self.code_preview.setPlainText(self.captured_code)
-            self.status_label.setText(f"Код успешно захвачен из 1С!")
-        else:
-            self.code_preview.setPlainText("⚠️ Внимание: Буфер пуст.")
-            self.status_label.setText("Ошибка: Текст в 1С не выделен")
-            
-        self.input_field.setFocus()
+        self.status_label.setText(f"Статус: Код захвачен")
+        self.output_area.append(f"\n[Система] Захвачен контекст окна: {window_title}")
+        # Автоматически обновляем дерево при захвате нового кода
+        self.show_metadata_tree()
 
-    def process_input(self):
-        """Запуск фоновой обработки запроса через ИИ"""
-        query = self.input_field.text().strip()
-        if not query:
-            return
+    def show_metadata_tree(self):
+        """Запрашивает данные из 1С и строит настоящее графическое дерево элементов"""
+        self.tree_widget.clear()
+        self.status_label.setText("Статус: Сбор метаданных из 1С...")
+        
+        # Получаем имя объекта из заголовка или берем то, что ввел юзер в поле ввода
+        target_obj = self.query_input.text().strip()
+        if not target_obj:
+            target_obj = self.router.parse_object_name_from_title(self.current_window_title)
             
-        self.chat_area.append(f"<b>Вы:</b> {query}")
-        self.input_field.clear()
+        # Стучимся в HTTP-сервис 1С за словарем
+        raw_data = self.router.get_1c_metadata_raw(target_obj)
         
-        if query.startswith("/pattern "):
-            new_pattern = query.replace("/pattern ", "")
-            self.router.set_pattern_from_supermodel(new_pattern)
-            self.chat_area.append("<font color='green'><b>Системный паттерн обновлен!</b></font><br>")
+        if "error" in raw_data:
+            self.status_label.setText("Статус: Ошибка сбора")
+            root_item = QTreeWidgetItem(self.tree_widget, [raw_data["error"], ""])
             return
+
+        # Строим корень дерева (Сам Объект)
+        obj_name = raw_data.get("Имя", "Неопределено")
+        obj_synonym = raw_data.get("Синоним", "")
+        root_item = QTreeWidgetItem(self.tree_widget, [f"📦 {obj_name} ({obj_synonym})", "Объект Метаданных"])
+        root_item.setExpanded(True) # Сразу разворачиваем корень
         
-        self.status_label.setText("⏳ ИИ думает... (Окно доступно)")
-        self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-        self.chat_area.append("<font color='gray'><i>🤖 Запрос обрабатывается в фоне. Вы можете продолжать кодить в 1С...</i></font>")
-        self.send_btn.setEnabled(False)
-        self.tree_btn.setEnabled(False)
-        self.input_field.setEnabled(False)
+        # Создаем ветку Реквизиты
+        req_folder = QTreeWidgetItem(root_item, ["📂 Реквизиты шапки", ""])
+        req_folder.setExpanded(True)
         
-        self.worker = AIWorker(self.router, query, self.captured_code, self.current_window_title)
-        self.worker.result_ready.connect(self.on_ai_response_received)
+        for req in raw_data.get("Реквизиты", []):
+            QTreeWidgetItem(req_folder, [f"🔹 {req.get('Имя')}", req.get('Тиpt', req.get('Тип', ''))])
+            
+        self.status_label.setText("Статус: Графическое дерево построено")
+
+    def on_tree_item_clicked(self, item, column):
+        """СЛОТ-МАГИЯ: Вызывается автоматически при клике на элемент дерева мышкой"""
+        # Если кликнули по реквизиту (у него есть тип во второй колонке и это не папка)
+        item_name = item.text(0)
+        item_type = item.text(1)
+        
+        if item_type and not item_type in ["Объект Метаданных", ""]:
+            # Очищаем имя от иконки
+            clean_name = item_name.replace("🔹 ", "").strip()
+            self.selected_metadata_string = f"{clean_name} [{item_type}]"
+            self.status_label.setText(f"Фокус ИИ на реквизите: {clean_name}")
+            
+            # Если в поле ввода вопроса уже что-то написано, автоматически запускаем ИИ!
+            if self.query_input.text().strip():
+                print(f"[GUI] Интерактивный клик по реквизиту: {clean_name}. Запуск ИИ...")
+                self.start_ai_generation()
+
+    def start_ai_generation(self):
+        query = self.query_input.text().strip()
+        code = self.code_area.toPlainText().strip()
+        
+        # Защитная заглушка: если кода нет, даем ИИ работать просто по метаданным!
+        if not query:
+            query = f"Сделай обзор реквизита {self.selected_metadata_string} и напиши пример работы с ним в BSL."
+            
+        self.status_label.setText("Статус: Домашний ИИ думает...")
+        self.run_btn.setEnabled(False)
+        
+        # Передаем задачу в поток воркера, включая имя выбранного реквизита
+        self.worker = AIWorker(self.router, query, code, self.current_window_title, self.selected_metadata_string)
+        self.worker.result_ready.connect(self.on_ai_result_ready)
         self.worker.error_occurred.connect(self.on_ai_error)
         self.worker.start()
 
-    @pyqtSlot(dict)
-    def on_ai_response_received(self, result):
-        self.send_btn.setEnabled(True)
-        self.tree_btn.setEnabled(True)
-        self.input_field.setEnabled(True)
-        self.status_label.setText("Статус: Ответ получен")
-        self.status_label.setStyleSheet("color: green; font-weight: bold;")
-        
-        if result["contour"] == "internal":
-            self.last_ai_response = result["payload"]
-            self.chat_area.append(f"<b>Qwen:</b> {result['payload']}<br>")
-        else:
-            self.chat_area.append(f"<pre style='background:#fff3cd; padding:5px;'>{result['payload']}</pre><br>")
-            self.chat_area.append("<i>Скопируйте текст выше супермодели.</i>")
-            
-        self.input_field.setFocus()
+    def on_ai_result_ready(self, result_text):
+        self.output_area.setText(result_text) # Выводим чистый ответ ИИ
+        self.status_label.setText("Статус: Ответ готов")
+        self.run_btn.setEnabled(True)
 
-    @pyqtSlot(str)
-    def on_ai_error(self, error_msg):
-        self.send_btn.setEnabled(True)
-        self.tree_btn.setEnabled(True)
-        self.input_field.setEnabled(True)
-        self.status_label.setText("Статус: Ошибка сети")
-        self.status_label.setStyleSheet("color: red; font-weight: bold;")
-        self.chat_area.append(f"<font color='red'><b>Ошибка:</b> {error_msg}</font><br>")
-
-    def show_metadata_tree(self):
-        """Прямой синхронный запрос дерева структуры из 1С без участия ИИ"""
-        self.status_label.setText("⏳ Считывание структуры из базы 1С...")
-        self.status_label.setStyleSheet("color: blue; font-weight: bold;")
-        QApplication.processEvents()
-        
-        # Получаем сгенерированный псевдографический текст из router.py
-        tree_text = self.router.generate_metadata_tree_text(self.current_window_title)
-        
-        self.chat_area.append("<font color='purple'><b>--- СТРУКТУРА ОБЪЕКТА (ЖИВОЙ КОНТЕКСТ) ---</b></font>")
-        self.chat_area.append(f"<pre style='background:#f3e5f5; font-family:Consolas; font-size:11px; padding:8px;'>{tree_text}</pre><br>")
-        
-        self.status_label.setText("Статус: Дерево метаданных построено")
-        self.status_label.setStyleSheet("color: green; font-weight: bold;")
+    def on_ai_error(self, error_text):
+        self.output_area.setText(f"❌ Критическая ошибка ИИ: {error_text}")
+        self.status_label.setText("Статус: Сбой генерации")
+        self.run_btn.setEnabled(True)
 
     def paste_code_to_1c(self):
-        if not self.last_ai_response:
-            self.status_label.setText("Ошибка: Нечего вставлять.")
+        self.status_label.setText("Статус: Вставка кода в 1С...")
+        ai_code = self.output_area.toPlainText()
+        if not ai_code.strip():
             return
-            
-        clean_code = self.last_ai_response
-        if "```" in clean_code:
-            lines = clean_code.split("\n")
-            clean_lines = [l for l in lines if not l.strip().startswith("```")]
-            clean_code = "\n".join(clean_lines)
-            
         clipboard = QApplication.clipboard()
-        clipboard.setText(clean_code.strip())
-        
-        self.status_label.setText("Вставка кода...")
-        time.sleep(0.3)
-        
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        time.sleep(0.05)
-        ctypes.windll.user32.keybd_event(VK_V, 0, 0, 0)
-        time.sleep(0.05)
-        ctypes.windll.user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
-        ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        
-        self.status_label.setText("Код успешно передан в Конфигуратор!")
+        clipboard.setText(ai_code)
+        self.status_label.setText("Статус: Код в буфере. Нажмите Ctrl+V в 1С.")
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    main_win = MainAIDockApp()
-    main_win.show()
-    sys.exit(app.exec())
