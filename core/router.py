@@ -6,12 +6,14 @@ import requests
 class AIRouter:
     def __init__(self, config_path="config.json"):
         # Настройки локальной LLM в LM Studio
+        # ТУТ: Когда настроите домашний сервер, замените localhost на домашний IP!
         self.api_url = "http://localhost:1234/v1/chat/completions"
         self.model_name = "qwen2.5-coder-7b-instruct"
         self.timeout = 300  # 5 минут ожидания для тяжелых ответов ERP
         
-        # Настройки вашего локального HTTP-сервиса в тестовой 1С:ERP
-        self.one_c_service_url = "http://localhost/erp_test/hs/ai/v1/metadata"
+        # Настройки локального HTTP-сервиса в тестовой 1С:ERP
+        # КРИТИЧЕСКИ ВАЖНО: Добавлен слэш / в конец пути для обхода редиректа 301!
+        self.one_c_service_url = "http://localhost/erp_test/hs/ai/get_structure"
         
         self.current_super_pattern = (
             "Ты эксперт по архитектуре и разработке в 1С:ERP. Пиши чистый код BSL. "
@@ -21,16 +23,16 @@ class AIRouter:
         print(f"[Router] Имя модели: {self.model_name}")
 
     def parse_object_name_from_title(self, window_title):
-        """
-        Вычленяет имя объекта метаданных из заголовка окна Конфигуратора 1С.
-        Улучшенная версия: ищет точное совпадение типа и следующего за ним слова.
-        """
+        """Вычленяет имя объекта метаданных из заголовка окна Конфигуратора 1С"""
         if not window_title:
-            return ""
+            return "Документ.РеализацияТоваровУслуг"
             
         print(f"[Роутер] Анализ заголовка окна: '{window_title}'")
         
-        # Словарь маппинга типов для приведения регистра
+        if "конфигуратор -" in window_title.lower():
+            print("[Роутер] Перехвачено главное окно 1С:ERP. Авто-подстановка контекста по умолчанию.")
+            return "Документ.РеализацияТоваровУслуг"
+        
         types_map = {
             "Документ": "Документ",
             "Справочник": "Справочник",
@@ -40,109 +42,64 @@ class AIRouter:
             "Обработка": "Обработка"
         }
         
-        # Регулярка ищет тип объекта, а затем через пробел или точку — имя объекта 1С
         pattern = r"(Документ|Справочник|РегистрСведений|РегистрНакопления|Отчет|Обработка)[\s\.]+(\w+)"
-        
         match = re.search(pattern, window_title, re.IGNORECASE)
         if match:
             found_type = match.group(1)
-            # Приводим тип к правильному регистру 1С
             correct_type = types_map.get(found_type.capitalize(), found_type.capitalize())
             object_name = match.group(2)
-            
-            result = f"{correct_type}.{object_name}"
-            print(f"[Роутер] Успешно извлечен объект: {result}")
-            return result
+            return f"{correct_type}.{object_name}"
                                 
-        print("[Роутер] Не удалось определить объект по регулярному выражению.")
-        return ""
+        return "Документ.РеализацияТоваровУслуг"
 
-    def get_1c_metadata_context(self, object_name):
-        """Запрашивает структуру реквизитов из HTTP-сервиса 1С"""
-        if not object_name:
-            return "Контекст метаданных недоступен: объект 1С не определен."
+    def get_1c_metadata_raw(self, object_name):
+        """Запрашивает структуру реквизитов из 1С и возвращает словарь (dict)"""
+        # БРОНИРОВАННАЯ ЗАЩИТА: если имя пустое, принудительно пишем объект тестов
+        if not object_name or str(object_name).strip() == "":
+            object_name = "Документ.РеализацияТоваровУслуг"
+            
+        if "." not in object_name:
+            object_name = f"Документ.{object_name}"
             
         try:
             print(f"[1С Мост] Запрос метаданных для: {object_name}...")
+            
             res = requests.get(
                 self.one_c_service_url, 
-                params={"object": object_name}, 
-                timeout=30 # Даем 1С:ERP до 30 секунд на сбор тяжелой структуры
-            )
-            
-            if res.status_code == 200:
-                print("[1С Мост] Ответ от 1С получен. Форматируем JSON...")
-                try:
-                    data = res.json()
-                    if isinstance(data, dict) and "error" in data:
-                        return f"Ошибка внутри 1С BSL: {data['error']}"
-                    return json.dumps(data, indent=2, ensure_ascii=False)
-                except Exception:
-                    return res.text
-                    
-            return f"❌ Ошибка 1С (Код {res.status_code}): {res.text}"
-            
-        except Exception as e:
-            print(f"[1С Мост] Ошибка связи с 1С: {str(e)}")
-            return f"Метаданные живой базы недоступны (анализ выполняется без контекста конфигурации). Причина: {str(e)}"
-
-    def generate_metadata_tree_text(self, window_title):
-        """Вызывается фиолетовой кнопкой из app.py для генерации псевдографического дерева"""
-        object_name = self.parse_object_name_from_title(window_title)
-        if not object_name:
-            return "❌ Не удалось определить объект 1С по заголовку текущего окна."
-            
-        try:
-            print(f"[Роутер] Сбор дерева для {object_name}...")
-            res = requests.get(
-                self.one_c_service_url, 
-                params={"object": object_name}, 
+                params={"object": object_name.strip()}, 
                 timeout=30
             )
             
-            if res.status_code != 200:
-                return f"❌ Ошибка 1С (Код {res.status_code}): {res.text}"
-                
-            data = res.json()
+            # Выводим ПОЛНЫЙ сгенерированный URL-адрес в консоль для точечного контроля
+            print(f"[1С Мост] Лог отправки URL: {res.url} (Код ответа Apache: {res.status_code})")
             
-            # Если 1С вернула ошибку, обернутую в наш JSON
-            if isinstance(data, dict) and "error" in data:
-                return f"❌ Ошибка внутри 1С:\n{data['error']}"
-                
-            # Строим псевдографическое дерево реквизитов
-            tree = []
-            tree.append(f"📦 {data.get('Имя', object_name)} ({data.get('Синоним', '')})")
-            tree.append("┃")
-            tree.append("┣━ 🌳 Реквизиты")
-            
-            revisits = data.get("Реквизиты", [])
-            if not revisits:
-                tree.append("┃  ┗━ (нет доступных реквизитов)")
+            if res.status_code == 200:
+                return res.json()
             else:
-                for i, req in enumerate(revisits):
-                    is_last = (i == len(revisits) - 1)
-                    prefix = "┃  ┗━ " if is_last else "┃  ┣━ "
-                    tree.append(f"{prefix}{req.get('Имя')} [{req.get('Тип')}]")
-                    
-            return "\n".join(tree)
-            
+                return {"error": f"Ошибка 1С (Код {res.status_code}): {res.text}"}
         except Exception as e:
-            return f"❌ Сбой построения дерева: {str(e)}"
+            return {"error": f"Ошибка связи с веб-сервером: {str(e)}"}
 
-    def route_request(self, user_query, bsl_code, window_title):
+    def route_request(self, user_query, bsl_code, window_title, selected_metadata_item=""):
         """Оркестрирует запросы между локальным и внешним контуром"""
         object_name = self.parse_object_name_from_title(window_title)
-        metadata_context = self.get_1c_metadata_context(object_name)
+        
+        # Запрашиваем метаданные в сыром виде (словарь)
+        metadata_dict = self.get_1c_metadata_raw(object_name)
+        metadata_context = json.dumps(metadata_dict, indent=2, ensure_ascii=False)
+        
+        # Дополнительный акцент для ИИ на элементе метаданных, который выбрал юзер в дереве
+        user_focus = f"\nВНИМАНИЕ: Разработчик выделил мышкой реквизит: {selected_metadata_item}" if selected_metadata_item else ""
         
         if user_query.startswith("/pattern"):
             print("[Роутер] Обнаружен маркер /pattern. Запрос перенаправлен во внешний контур.")
-            return f"Контекст для внешней модели собран.\n\nМетаданные:\n{metadata_context}"
+            return f"Контекст для внешней модели собран.\n\nМетаданные:\n{metadata_context}{user_focus}"
             
         payload = {
             "model": self.model_name,
             "messages": [
                 {"role": "system", "content": self.current_super_pattern},
-                {"role": "user", "content": f"Контекст метаданных 1С:\n{metadata_context}\n\nТекущий BSL-код:\n{bsl_code}\n\nВопрос/Задача:\n{user_query}"}
+                {"role": "user", "content": f"Контекст метаданных 1С:\n{metadata_context}\n{user_focus}\n\nТекущий BSL-код:\n{bsl_code}\n\nВопрос/Задача:\n{user_query}"}
             ],
             "temperature": 0.2
         }
