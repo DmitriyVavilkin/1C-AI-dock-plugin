@@ -1,4 +1,19 @@
+
 {
+  "ibsrv": {
+    "host": "http://localhost:8314",
+    "base_name": "mpk_new_vavilkin",
+    "user_1c": "ВавилкинДА",
+    "pass_1c": "_257"
+  },
+  "postgres": {
+    "host": "172.16.30.204",
+    "database": "1C_AI_Database",
+    "user": "postgres",
+    "password": "Viseo193DX",
+    "port": 5432
+  },
+  
   "local_llm": {
     "api_url": "http://172.21.0.179:1234/v1",
     "model_name": "qwen2.5-coder-7b-instruct",
