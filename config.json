@@ -3,14 +3,14 @@
   "ibsrv": {
     "host": "http://localhost:8314",
     "base_name": "mpk_new_vavilkin",
-    "user_1c": "ВавилкинДА",
-    "pass_1c": "_257"
+    "user_1c": "",
+    "pass_1c": ""
   },
   "postgres": {
     "host": "172.16.30.204",
     "database": "1C_AI_Database",
     "user": "postgres",
-    "password": "Viseo193DX",
+    "password": "",
     "port": 5432
   },
   
