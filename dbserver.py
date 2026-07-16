@@ -2,6 +2,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import zlib
 import re
+import uuid
 
 class AIDatabaseManger:
     def __init__(self, source_db_config, ai_db_config):

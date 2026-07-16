@@ -2,3 +2,4 @@ __pycache__/
 config.py
 config.ini
 config.json
+test_sql_read.py

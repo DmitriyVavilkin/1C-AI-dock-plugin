@@ -3,7 +3,7 @@ from dbserver import AIDatabaseManger
 # Общие сетевые реквизиты СУБД
 DB_HOST = "172.16.30.204"
 DB_USER = "postgres"
-DB_PASS = " "  # Укажите здесь ваш реальный пароль к Postgres
+DB_PASS = "Viseo193DX"  # Укажите здесь ваш реальный пароль к Postgres
 
 # Контур 1: Откуда читаем (Рабочая база 1С)
 SOURCE_1C_CONFIG = {
