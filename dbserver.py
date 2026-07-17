@@ -105,82 +105,215 @@ class DBServerManager:
     # ====================================================================
     # ШАГ 1 И ШАГ 2: ИЗВЛЕЧЕНИЕ ОБЪЕКТОВ И НАСТОЯЩЕГО BSL-КОДА
     # ====================================================================
-    def extract_and_cache_source_codes(self):
-        """
-        Шаг 2: ТОТАЛЬНЫЙ АВТОНОМНЫЙ СБОР КОДА BSL.
-        Сканирует таблицу config 1С напрямую, выкачивая ВСЕ существующие модули объектов (.0)
-        и модули менеджеров (.m) без привязки к физическим именам таблиц.
-        """
-        self.init_ai_tables()
-        print("\n🚀 Шаг 2: Прямой высокоскоростной сбор BSL-кода из config 1С...")
+import zlib
+import uuid
+import json
+
+def extract_and_cache_source_codes(self):
+    """
+    Шаг 2: Прямое извлечение BSL-кода (.0 и .m) из таблицы config 1С,
+    декомпрессия raw deflate и кэширование в базу данных ИИ.
+    """
+    print("[🔄] Старт автономного извлечения BSL-кодов из config...")
+    
+    # 1. Подключаемся к базе 1С и к базе ИИ через унифицированную точку
+    conn_1c = self._connect_db() # Предполагаем, что метод адаптируется под выбор базы, либо используем два разных подключения
+    conn_ai = self._connect_db() # Настройте параметры подключения под ваши реалии config.json
+    
+    cursor_1c = conn_1c.cursor()
+    cursor_ai = conn_ai.cursor()
+    
+    # SQL-запрос для выкачивания всех модулей
+    query_1c = "SELECT filename, binarydata FROM config WHERE filename LIKE '%.0' OR filename LIKE '%.m';"
+    
+    try:
+        cursor_1c.execute(query_1c)
+        records = cursor_1c.fetchall()
+        print(f"[📊] Найдено {len(records)} бинарных модулей в таблице config.")
         
-        modules_found = 0
-        with self.conn_source.cursor() as cur_src, self.conn_ai.cursor() as cur_ai:
-            # Очищаем таблицу кодов перед заливкой
-            cur_ai.execute("TRUNCATE ai_source_codes;")
-            
-            # ВЫБИРАЕМ НАПРЯМУЮ ИЗ 1С: Все файлы, которые являются модулями кода (.0 или .m)
-            # Запрос моментально отрабатывает по индексам таблицы config
-            query_all_codes = """
-                SELECT filename, binarydata 
-                FROM config 
-                WHERE filename LIKE '%.0' 
-                   OR filename LIKE '%.m'
-                   OR filename LIKE '%_demo_%.0'
-                   OR filename LIKE '%_demo_%.m';
-            """
+        cached_count = 0
+        for filename, binarydata in records:
+            if not binarydata:
+                continue
+                
             try:
-                cur_src.execute(query_all_codes)
-                rows = cur_src.fetchall()
+                # Декомпрессия raw deflate (wbits=-zlib.MAX_WBITS игнорирует zlib-заголовки)
+                raw_data = zlib.decompress(bytes(binarydata), -zlib.MAX_WBITS)
+                
+                # Декодируем в UTF-8, корректно обрабатывая BOM-сигнатуру
+                source_code = raw_data.decode('utf-8-sig', errors='ignore')
+                
+                # Генерируем UUID для сущности ИИ
+                ai_uuid = str(uuid.uuid4())
+                
+                # Подготовка к записи в ai_metadata_objects
+                # Адаптируйте имена полей (например: id, filename, source_code, object_type) под вашу схему
+                query_ai = """
+                    INSERT INTO ai_metadata_objects (id, filename, source_code, is_active)
+                    VALUES (%s, %s, %s, TRUE)
+                    ON CONFLICT (filename) DO UPDATE 
+                    SET source_code = EXCLUDED.source_code;
+                """
+                cursor_ai.execute(query_ai, (ai_uuid, filename, source_code))
+                cached_count += 1
+                
+            except zlib.error as ze:
+                # Некоторые файлы в config могут быть не сжаты или иметь другой формат, пропускаем их
+                continue
             except Exception as e:
-                self.conn_source.rollback()
-                print(f"❌ Ошибка прямого запроса кодов к СУБД 1С: {e}")
-                return
-
-            print(f"   [Инфо] Найдено {len(rows)} бинарных файлов модулей в СУБД 1С. Начинаем распаковку...")
-
-            for idx, (filename, binarydata) in enumerate(rows, 1):
-                # Распаковываем zlib-поток (v8-deflate)
-                bsl_text_content = self.decompress_1c_container(binarydata)
-                if not bsl_text_content or not bsl_text_content.strip():
-                    continue
+                print(f"[❌] Ошибка обработки файла {filename}: {e}")
+                continue
                 
-                # Пропускаем служебные заголовки структуры, если они случайно попали
-                if bsl_text_content.startswith('{') and ('"#" ' in bsl_text_content or '{"#' in bsl_text_content):
-                    continue
+        conn_ai.commit()
+        print(f"[✅] Успешно синхронизировано и кэшировано модулей в базу ИИ: {cached_count}")
+        
+    except Exception as e:
+        print(f"[💥] Критическая ошибка при работе с СУБД: {e}")
+        conn_1c.rollback()
+        conn_ai.rollback()
+    finally:
+        cursor_1c.close()
+        cursor_ai.close()
+        conn_1c.close()
+        conn_ai.close()
 
-                # Идентификатором кода в базе ИИ становится чистый хэш файла (логический UUID 1С)
-                clean_obj_id = str(filename).strip().replace('.0', '').replace('.m', '')
-                
-                # Подстраховка: если объект метаданных для этого кода еще не был создан на Шаге 1,
-                # мы автоматически создаем под него заглушку в ai_metadata_objects, чтобы не нарушать foreign key!
-                try:
-                    cur_ai.execute("""
-                        INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, synonym)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (object_id) DO NOTHING;
-                    """, (clean_obj_id, "CommonModule", f"Module_{clean_obj_id[:8]}", f"ОбщийМодуль_{clean_obj_id[:8]}"))
-                    
-                    # Записываем чистый BSL-код в изолированную базу ИИ
-                    cur_ai.execute("""
-                        INSERT INTO ai_source_codes (object_id, bsl_text)
-                        VALUES (%s, %s)
-                        ON CONFLICT (object_id) DO UPDATE SET bsl_text = EXCLUDED.bsl_text;
-                    """, (clean_uuid, bsl_text_content))
-                    
-                    modules_found += 1
-                except Exception as e:
-                    cur_ai.rollback()
-                    continue
-
-                if idx % 500 == 0 or idx == len(rows):
-                    # Принудительно коммитим пачками для надежности
-                    self.conn_ai.commit()
-                    print(f" ⏳ Декомпрессия модулей: {idx}/{len(rows)} (Успешно сохранено чистых BSL-файлов: {modules_found})")
-            
-            self.conn_ai.commit()
-            
         print(f"🏁 Шаг 2 завершен! В СУБД ИИ успешно кэшировано {modules_found} чистых BSL-модулей.")
+ 
+import zlib
+import json
+import re
+import uuid
+
+def sync_metadata_structure(self):
+    """
+    Шаг 2.1: Извлечение структуры метаданных (типы, имена объектов и их UUID)
+    из системных таблиц config 1С для построения дерева GUI.
+    """
+    print("[🔄] Старт извлечения структуры метаданных из 1С...")
+    
+    # Подключения к базам (используем вашу точку _connect_db())
+    conn_1c = self._connect_db()  
+    conn_ai = self._connect_db()  
+    
+    cursor_1c = conn_1c.cursor()
+    cursor_ai = conn_ai.cursor()
+    
+    # Шаг 1: Проверяем и создаем целевую таблицу в базе ИИ, если её нет
+    cursor_ai.execute("""
+        CREATE TABLE IF NOT EXISTS ai_metadata_objects (
+            id UUID PRIMARY KEY,
+            filename VARCHAR(255) UNIQUE,
+            object_name VARCHAR(255),
+            object_type VARCHAR(100),
+            logical_uuid VARCHAR(50),
+            source_code TEXT,
+            is_active BOOLEAN DEFAULT TRUE
+        );
+    """)
+    conn_ai.commit()
+    
+    # Шаг 2: Читаем корневые метаданные 1С, чтобы понять состав конфигурации
+    # В config файлы метаданных лежат под фиксированными UUID или именем 'root'
+    query_1c = "SELECT filename, binarydata FROM config WHERE filename IN ('root', 'metadata') OR filename LIKE '__________-____-____-____-____________';"
+    
+    try:
+        cursor_1c.execute(query_1c)
+        records = cursor_1c.fetchall()
+        print(f"[📊] Прочитано {len(records)} системных структурных файлов из config.")
+        
+        objects_discovered = 0
+        
+        for filename, binarydata in records:
+            if not binarydata:
+                continue
+                
+            try:
+                # Декомпрессия raw deflate
+                raw_data = zlib.decompress(bytes(binarydata), -zlib.MAX_WBITS)
+                text_content = raw_data.decode('utf-8-sig', errors='ignore')
+                
+                # Текстовое представление метаданных 1С — это вложенные массивы вида {"#", ...}
+                # Используем регулярные выражения, чтобы вытащить связки: Логическое Имя - UUID объекта
+                # Ищем паттерны UUID и идущие рядом кириллические/латинские идентификаторы классов 1С
+                
+                # Поиск всех UUID в текущем блоке конфигурации
+                uuids = re.findall(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', text_content)
+                
+                # Типичные маркеры типов объектов в манифесте 1С
+                metadata_types = {
+                    "Catalogs": "Справочник",
+                    "Documents": "Документ",
+                    "Reports": "Отчет",
+                    "DataProcessors": "Обработка",
+                    "InformationRegisters": "РегистрСведений",
+                    "AccumulationRegisters": "РегистрНакопления",
+                    "CommonModules": "ОбщийМодуль"
+                }
+                
+                for obj_uuid in set(uuids):
+                    obj_uuid_lower = obj_uuid.lower()
+                    
+                    # Пытаемся определить тип и имя объекта по контексту вокруг UUID
+                    # Ищем текстовые строки в пределах 200 символов от найденного UUID
+                    pos = text_content.find(obj_uuid)
+                    context = text_content[max(0, pos-100):min(len(text_content), pos+200)]
+                    
+                    # Извлекаем потенциальное имя объекта (строка в кавычках)
+                    names = re.findall(r'"([A-Za-zА-Яа-я0-9_]+)"', context)
+                    if not names:
+                        continue
+                        
+                    object_name = names[0]
+                    
+                    # Игнорируем технические системные слова 1С
+                    if object_name in ['Metadata', 'Root', 'Version', 'DataHistory']:
+                        continue
+                        
+                    # Определяем тип объекта 1С
+                    object_type = "ОбъектМетаданных"
+                    for eng_type, rus_type in metadata_types.items():
+                        if eng_type.lower() in context.lower():
+                            object_type = rus_type
+                            break
+                    
+                    # Формируем виртуальные имена файлов .0 и .m для связи с кодом
+                    # 1С привязывает модули к UUID объекта
+                    for ext in ['.0', '.m']:
+                        virtual_filename = f"{obj_uuid_lower}{ext}"
+                        ai_id = str(uuid.uuid4())
+                        
+                        # Сохраняем каркас метаданных в базу ИИ
+                        query_ai = """
+                            INSERT INTO ai_metadata_objects (id, filename, object_name, object_type, logical_uuid, is_active)
+                            VALUES (%s, %s, %s, %s, %s, TRUE)
+                            ON CONFLICT (filename) DO UPDATE 
+                            SET object_name = EXCLUDED.object_name,
+                                object_type = EXCLUDED.object_type,
+                                logical_uuid = EXCLUDED.logical_uuid;
+                        """
+                        cursor_ai.execute(query_ai, (ai_id, virtual_filename, object_name, object_type, obj_uuid_lower))
+                        objects_discovered += 1
+                        
+            except zlib.error:
+                continue # Файл не сжат или это не deflate, пропускаем
+            except Exception as e:
+                print(f"[⚠️] Пропущена запись при парсинге {filename}: {e}")
+                continue
+                
+        conn_ai.commit()
+        print(f"[✅] Структура метаданных успешно импортирована. Создано/обновлено связей: {objects_discovered}")
+        
+    except Exception as e:
+        print(f"[💥] Ошибка при чтении структуры метаданных: {e}")
+        conn_1c.rollback()
+        conn_ai.rollback()
+    finally:
+        cursor_1c.close()
+        cursor_ai.close()
+        conn_1c.close()
+        conn_ai.close()
+ 
+ 
     # ====================================================================
     # ШАГ 3: ИЗВЛЕЧЕНИЕ РЕКВИЗИТОВ С ГЕНЕРАЦИЕЙ UUID В PYTHON
     # ====================================================================
