@@ -1,14 +1,15 @@
 
 {
-  "ibsrv": {
-    "host": "http://localhost:8314",
-    "base_name": "mpk_new_vavilkin",
-    "user_1c": "",
-    "pass_1c": ""
-  },
-  "postgres": {
+  "db_1c": {
     "host": "172.16.30.204",
-    "database": "1C_AI_Database",
+    "dbname": "mpk_new_vavilkin",
+    "user": "postgres",
+    "password": "Viseo193DX",
+    "port": 5432
+  },
+  "db_ai": {
+    "host": "172.16.30.204",
+    "dbname": "1C_AI_Database",
     "user": "postgres",
     "password": "Viseo193DX",
     "port": 5432
@@ -23,3 +24,5 @@
     "capture_code": "ctrl+shift+x"
   }
 }
+
+

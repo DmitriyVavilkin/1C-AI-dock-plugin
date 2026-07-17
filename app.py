@@ -38,7 +38,7 @@ class AI_IDE_1C(QMainWindow):
             "host": pg.get("host", "172.16.30.204"),
             "database": pg.get("database", "1C_AI_Database"),
             "user": pg.get("user", "postgres"),
-            "password": pg.get("password", ""),
+            "password": pg.get("password", "Viseo193DX"),
             "port": pg.get("port", 5432)
         }
         
@@ -333,8 +333,109 @@ class AI_IDE_1C(QMainWindow):
         """Заглушка OCR"""
         QMessageBox.information(self, "OCR Модуль", "Здесь мы подключим mss + EasyOCR для автоматического распознавания ошибок с экрана.")
 
+# =====================================================================
+# ДИНАМИЧЕСКИЙ ПАТЧ ДЛЯ ИНТЕРФЕЙСА (ПИШЕТСЯ У ЛЕВОГО КРАЯ - 0 ПРОБЕЛОВ)
+# =====================================================================
+def inject_fixed_gui_logic(main_window_instance):
+    """
+    Переопределяет методы загрузки дерева и клика в app.py 
+    под реальную схему таблиц 1C_AI_Database.
+    """
+    print("[🎨] Накатывание интерфейсного хот-фикса на app.py...")
+    
+    # Ссылаемся на наш экземпляр менеджера СУБД, который используется в приложении
+    # Предполагаем, что внутри главного окна он сохранен в self.db или self.db_manager
+    db_manager = getattr(main_window_instance, 'db', None) or getattr(main_window_instance, 'db_manager', None)
+    
+    if not db_manager:
+        print("[⚠️] Не удалось автоматически найти объект DBServerManager внутри вашего окна.")
+        return
+
+    # 1. ПЕРЕОПРЕДЕЛЯЕМ МЕТОД ЗАПОЛНЕНИЯ ДЕРЕВА
+    def fixed_load_tree_data():
+        print("[🔄] GUI запрашивает структуру метаданных для дерева...")
+        # Очищаем старое дерево (замените self.treeWidget на ваше имя виджета дерева)
+        tree_widget = getattr(main_window_instance, 'treeWidget', None) or getattr(main_window_instance, 'tree', None)
+        if not tree_widget:
+            return
+        
+        tree_widget.clear()
+        
+        # Берем открытый коннект ИИ из нашего бэкенда
+        cursor = db_manager.conn_ai.cursor()
+        try:
+            # Выбираем точные поля: тип, синоним для отображения и internal_name для связи с кодом
+            cursor.execute("SELECT object_type, synonym, internal_name FROM ai_metadata_objects;")
+            rows = cursor.fetchall()
+            
+            # Собираем категории в дереве
+            categories = {}
+            from PyQt6.QtWidgets import QTreeWidgetItem
+            
+            for obj_type, synonym, internal_name in rows:
+                if not obj_type:
+                    obj_type = "ПрочиеМодули"
+                if obj_type not in categories:
+                    parent_item = QTreeWidgetItem(tree_widget, [obj_type])
+                    categories[obj_type] = parent_item
+                
+                # Создаем дочерний узел: на экран выводим Синоним, а имя файла прячем в скрытую колонку или роль
+                child_item = QTreeWidgetItem(categories[obj_type], [synonym])
+                # Сохраняем имя файла (internal_name) во вторую скрытую колонку (индекс 1) для обработчика клика
+                child_item.setText(1, internal_name)
+                
+            print(f"[✅] Дерево GUI успешно перестроено. Отображено категорий: {len(categories)}")
+        except Exception as e:
+            print(f"[❌] Ошибка заполнения дерева в GUI: {e}")
+        finally:
+            cursor.close()
+
+    # 2. ПЕРЕОПРЕДЕЛЯЕМ МЕТОД КЛИКА ПО ДЕРЕВУ
+    def fixed_on_item_clicked(item, column):
+        # Если кликнули по родительской категории, у которой нет скрытого имени файла, ничего не делаем
+        internal_name = item.text(1)
+        if not internal_name:
+            return
+            
+        print(f"[🖱️] Клик по объекту дерева. Запрос кода для файла: {internal_name}")
+        
+        # Получаем виджет текстового редактора кода (замените на имя вашего QTextEdit)
+        code_editor = getattr(main_window_instance, 'codeEditor', None) or getattr(main_window_instance, 'textEdit', None) or getattr(main_window_instance, 'code_edit', None)
+        
+        if not code_editor:
+            print("[⚠️] Не найден виджет текстового редактора в главном окне.")
+            return
+            
+        cursor = db_manager.conn_ai.cursor()
+        try:
+            # Запрос в нашу новую изолированную таблицу кодов по code_filename
+            cursor.execute("SELECT source_code FROM ai_metadata_source_codes WHERE code_filename = %s;", (internal_name,))
+            result = cursor.fetchone()
+            
+            if result and result[0]:
+                code_editor.setPlainText(result[0])
+                print(f"[✅] Чистый BSL-код модуля успешно выведен на экран ({len(result[0])} симв.)")
+            else:
+                code_editor.setPlainText(f"// Исходный код для модуля {internal_name} не найден в базе ИИ.")
+        except Exception as e:
+            print(f"[❌] Ошибка загрузки кода в редактор: {e}")
+        finally:
+            cursor.close()
+
+    # Привязываем наши новые исправленные функции к экземпляру окна
+    # Замените 'load_tree' и 'on_tree_click' на реальные имена ваших методов в app.py
+    if hasattr(main_window_instance, 'load_tree'):
+        main_window_instance.load_tree = fixed_load_tree_data
+    if hasattr(main_window_instance, 'on_tree_click'):
+        main_window_instance.on_tree_click = fixed_on_item_clicked
+        
+    # Сразу вызываем обновление дерева, чтобы перерисовать интерфейс красивыми синонимами
+    fixed_load_tree_data()
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = AI_IDE_1C()
+    app = QApplication([])
+    window = AI_IDE_1C() # Имя вашего класса окна
+    # 🔥 ВСТАВЛЯЕМ НАШУ ВЫЗОВ СЮДА ПЕРЕД НАЧАЛОМ РАБОТЫ ОКНА:
+    inject_fixed_gui_logic(window)
     window.show()
-    sys.exit(app.exec())
+    app.exec()
