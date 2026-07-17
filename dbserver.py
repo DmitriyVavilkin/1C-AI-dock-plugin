@@ -1,255 +1,218 @@
-import psycopg2
-from psycopg2.extras import execute_values
-import zlib
+import json
+import os
 import re
-import uuid
+import zlib
+import uuid  # Критично для генерации field_id на стороне Python
+import psycopg2
+from psycopg2 import extras
 
-class AIDatabaseManger:
-    def __init__(self, source_db_config, ai_db_config):
+class DBServerManager:
+    def __init__(self, config_path="config.json"):
         """
-        Инициализация двухконтурного менеджера СУБД.
-        source_db_config: параметры подключения к боевой/тестовой СУБД 1С (mpk_new_vavilkin)
-        ai_db_config: параметры подключения к изолированной базе ИИ-IDE (1C_AI_Database)
+        Инициализация двухконтурного SQL-менеджера ИИ.
+        Автоматически подтягивает настройки хостов, баз и доступов из config.json.
         """
-        self.source_params = source_db_config
-        self.ai_params = ai_db_config
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"❌ Конфигурационный файл {config_path} не найден в корне проекта!")
+            
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+            
+        ibsrv = config_data.get("ibsrv", {})
+        pg = config_data.get("postgres", {})
         
-        self.conn_source = None  # Контур ЧТЕНИЯ (1С)
-        self.conn_ai = None      # Контур ЗАПИСИ (ИИ)
+        # Контур Чтения (Рабочая СУБД 1С)
+        self.db_1c_config = {
+            "host": pg.get("host", "172.16.30.204"),
+            "database": ibsrv.get("base_name", "mpk_new_vavilkin"),
+            "user": pg.get("user", "postgres"),
+            "password": pg.get("password", ""),
+            "port": pg.get("port", 5432)
+        }
+        
+        # Контур Записи (Изолированная база ИИ)
+        self.db_ai_config = {
+            "host": pg.get("host", "172.16.30.204"),
+            "database": pg.get("database", "1C_AI_Database"),
+            "user": pg.get("user", "postgres"),
+            "password": pg.get("password", ""),
+            "port": pg.get("port", 5432)
+        }
+        
+        self.conn_source = None  # Контур чтения (1С)
+        self.conn_ai = None      # Контур записи (ИИ)
+        self.connect_db()
 
-    def connect(self):
-        """Установка соединений с обеими СУБД"""
+    def connect_db(self):
+        """Устанавливает стабильное соединение с обоими контурами СУБД"""
         try:
-            # Подключаемся к источнику 1С
-            self.conn_source = psycopg2.connect(**self.source_params)
-            # Подключаемся к базе проекта ИИ
-            self.conn_ai = psycopg2.connect(**self.ai_params)
-            self.conn_ai.autocommit = True # Автокоммит для ИИ базы, чтобы данные сразу шли на диск
-            return True
+            self.conn_source = psycopg2.connect(**self.db_1c_config)
+            self.conn_ai = psycopg2.connect(**self.db_ai_config)
+            print("🚀 Двухконтурный SQL-менеджер успешно подключен к базам 1С и ИИ.")
         except Exception as e:
-            print(f"❌ Ошибка инициализации контуров СУБД: {e}")
-            return False
+            print(f"❌ Критическая ошибка подключения к базам данных: {e}")
+            raise e
 
-    def disconnect(self):
-        """Закрытие всех соединений"""
-        if self.conn_source:
-            self.conn_source.close()
-        if self.conn_ai:
-            self.conn_ai.close()
+    def init_ai_tables(self):
+        """Создает необходимую DDL-структуру таблиц в базе ИИ, если их еще нет"""
+        with self.conn_ai.cursor() as cur:
+            # Таблица объектов
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_metadata_objects (
+                    object_id VARCHAR(50) PRIMARY KEY,
+                    object_type VARCHAR(100),
+                    internal_name VARCHAR(255),
+                    synonym VARCHAR(255),
+                    api_table_name VARCHAR(100)
+                );
+            """)
+            # Таблица реквизитов и полей
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_metadata_fields (
+                    field_id UUID PRIMARY KEY,
+                    object_id VARCHAR(50) REFERENCES ai_metadata_objects(object_id) ON DELETE CASCADE,
+                    field_name VARCHAR(255),
+                    field_type VARCHAR(100)
+                );
+            """)
+            # Таблица чистых исходных кодов BSL
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_source_codes (
+                    object_id VARCHAR(50) PRIMARY KEY REFERENCES ai_metadata_objects(object_id) ON DELETE CASCADE,
+                    bsl_text TEXT
+                );
+            """)
+            self.conn_ai.commit()
 
     def decompress_1c_container(self, binary_data):
-        """Профессиональный распаковщик составных контейнеров 1С (CFont stream)"""
+        """Байтовый сканер для распаковки v8-deflate (zlib raw) напрямую из СУБД 1С"""
         if not binary_data:
-            return ""
-        raw_bytes = bytes(binary_data)
-        for offset in range(0, min(128, len(raw_bytes))):
+            return None
+        try:
             try:
-                decompressed = zlib.decompress(raw_bytes[offset:], -zlib.MAX_WBITS)
-                text = decompressed.decode('utf-8', errors='ignore')
-                if "{" in text:
-                    return text[text.find("{"):]
-            except Exception:
-                try:
-                    decompressed = zlib.decompress(raw_bytes[offset:], zlib.MAX_WBITS)
-                    text = decompressed.decode('utf-8', errors='ignore')
-                    if "{" in text:
-                        return text[text.find("{"):]
-                except Exception:
-                    continue
-        return ""
-    def get_raw_dbnames(self):
-        """Выкачивает и декомпрессирует DBNames из таблицы Params источника 1С"""
-        if not self.conn_source:
+                # Стандартный raw deflate (без zlib заголовков, wbits=-15)
+                return zlib.decompress(binary_data, -zlib.MAX_WBITS).decode('utf-8-sig', errors='ignore')
+            except zlib.error:
+                # Обычный zlib поток
+                return zlib.decompress(binary_data).decode('utf-8-sig', errors='ignore')
+        except Exception:
             return None
 
-        with self.conn_source.cursor() as cursor:
-            for table_name in ['Params', 'params', 'PARAMS']:
-                try:
-                    query = f"SELECT binarydata FROM {table_name} WHERE filename = 'DBNames';"
-                    cursor.execute(query)
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        print(f"📦 Бинарный блок DBNames прочитан из базы 1С (таблица '{table_name}').")
-                        return self.decompress_1c_container(row[0])
-                except Exception:
-                    # КРИТИЧЕСКИ ВАЖНО: сбрасываем ошибку транзакции в Postgres,
-                    # чтобы сервер разрешил выполнить следующий запрос к таблице с другим регистром!
-                    self.conn_source.rollback()
-                    continue
-            print("❌ Строка 'DBNames' не найдена в СУБД 1С.")
-            return None
-
-    def get_object_real_name(self, object_uuid):
-        """Точечно считывает UUID из таблицы Config 1С и вытаскивает русское имя объекта"""
-        if not self.conn_source:
-            return None
-
-        with self.conn_source.cursor() as cursor:
-            for table_name in ['config', 'Config', 'CONFIG']:
-                try:
-                    query = f"SELECT binarydata FROM {table_name} WHERE filename = %s;"
-                    cursor.execute(query, (object_uuid,))
-                    row = cursor.fetchone()
-                    if row and row:
-                        text_data = self.decompress_1c_container(row)
-                        if text_data:
-                            clean_text = re.sub(r'\s+', ' ', text_data)
-                            name_match = re.search(r'\}[\s,]*"([^"]+)"', clean_text)
-                            if name_match:
-                                return name_match.group(1)
-                except Exception:
-                    self.conn_source.rollback()
-                    continue
-        return None
-
-    def parse_and_sync_metadata(self):
-        """Оркестратор структуры: читает из 1С, обогащает именами и пишет в базу ИИ"""
-        raw_dbnames = self.get_raw_dbnames()
-        if not raw_dbnames:
-            return
-            
-        print("🔍 Фильтрация и интеллектуальный анализ бизнес-объектов 1С...")
-        clean_text = re.sub(r'\s+', ' ', raw_dbnames)
-        pattern = r'\{([a-f0-9\-]{36}),\s*"([^"]+)",\s*(\d+)\}'
-        matches = re.findall(pattern, clean_text)
-
-        if not matches:
-            print("📭 Не удалось выделить объекты из структуры DBNames.")
-            return
-
-        business_objects = []
-        for uuid, internal_name, sql_id in matches:
-            if uuid == "00000000-0000-0000-0000-000000000000":
-                continue
-
-            if internal_name.startswith('Reference') and not 'Field' in internal_name:
-                obj_type = "Catalog"
-            elif internal_name.startswith('Document') and not any(x in internal_name for x in ['Field', 'ChngR', 'VT']):
-                obj_type = "Document"
-            elif internal_name.startswith('InfoReg') and not any(x in internal_name for x in ['Field', 'ChngR', 'Dim', 'Rec']):
-                obj_type = "InformationRegister"
-            elif internal_name.startswith('AccumReg') and not any(x in internal_name for x in ['Field', 'ChngR', 'Dim', 'Rec', 'Rg']):
-                obj_type = "AccumulationRegister"
-            elif internal_name.startswith('Const') and not 'Field' in internal_name:
-                obj_type = "Constant"
-            else:
-                continue
-
-            business_objects.append({
-                'uuid': uuid,
-                'type': obj_type,
-                'sql_table': f"_{internal_name.lower()}"
-            })
-
-        print(f"🎯 Найдено {len(business_objects)} бизнес-объектов. Начинаем обогащение именами из СУБД 1С...")
-        
-        final_records = []
-        for idx, obj in enumerate(business_objects, 1):
-            real_name = self.get_object_real_name(obj['uuid'])
-            display_name = real_name if real_name else obj['sql_table']
-            full_display_name = f"{obj['type']}.{display_name}"
-            
-            if idx % 50 == 0 or idx == len(business_objects):
-                print(f" ⏳ Обработано объектов: {idx}/{len(business_objects)} ({full_display_name})")
-                
-            final_records.append((obj['uuid'], obj['type'], display_name, display_name))
-
+    def close(self):
+        """Безопасное закрытие пула соединений"""
+        if self.conn_source and not self.conn_source.closed: self.conn_source.close()
+        if self.conn_ai and not self.conn_ai.closed: self.conn_ai.close()
+    # ====================================================================
+    # ШАГ 1 И ШАГ 2: ИЗВЛЕЧЕНИЕ ОБЪЕКТОВ И НАСТОЯЩЕГО BSL-КОДА
+    # ====================================================================
+    def extract_and_cache_source_codes(self):
+        """
+        Шаг 2: ТОТАЛЬНЫЙ АВТОНОМНЫЙ СБОР КОДА BSL.
+        Сканирует таблицу config 1С напрямую, выкачивая ВСЕ существующие модули объектов (.0)
+        и модули менеджеров (.m) без привязки к физическим именам таблиц.
+        """
         self.init_ai_tables()
-        
-        with self.conn_ai.cursor() as cursor:
-            print("🧹 Очистка старой структуры в изолированной базе ИИ...")
-            cursor.execute("TRUNCATE ai_metadata_objects CASCADE;")
-            
-            print(f"💾 Запись {len(final_records)} обогащенных объектов в 1C_AI_Database...")
-            execute_values(cursor, """
-                INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, synonym)
-                VALUES %s
-                ON CONFLICT (object_id) DO NOTHING;
-            """, final_records)
-            
-        print("🏁 Синхронизация структуры завершена! Данные сохранены в базе проекта.")
-    def extract_and_cache_bsl_modules(self):
-        """Выкачивает BSL-код из СУБД 1С и кэширует в хранилище СУБД ИИ"""
-        self.init_ai_tables()
-        
-        # Читаем список объектов из нашей базы ИИ (conn_ai)
-        with self.conn_ai.cursor() as cursor:
-            cursor.execute("SELECT object_id, object_type, internal_name FROM ai_metadata_objects;")
-            objects = cursor.fetchall()
-            
-        print(f"\n🚀 Запуск сканирования BSL-кода из 1С для {len(objects)} объектов...")
+        print("\n🚀 Шаг 2: Прямой высокоскоростной сбор BSL-кода из config 1С...")
         
         modules_found = 0
-        # Читаем из 1С, пишем в ИИ
         with self.conn_source.cursor() as cur_src, self.conn_ai.cursor() as cur_ai:
+            # Очищаем таблицу кодов перед заливкой
             cur_ai.execute("TRUNCATE ai_source_codes;")
             
-            for idx, (obj_id, obj_type, obj_name) in enumerate(objects, 1):
-                if obj_type not in ['Catalog', 'Document']:
-                    continue
-                    
-                cur_src.execute("SELECT binarydata FROM config WHERE filename = %s;", (obj_id,))
-                row = cur_src.fetchone()
-                if not row or not row[0]:
-                    continue
-                    
-                text_container = self.decompress_1c_container(row[0])
-                if not text_container:
-                    continue
-                    
-                all_child_uuids = re.findall(r'[a-f0-9\-]{36}', text_container)
-                
-                for child_uuid in set(all_child_uuids):
-                    if child_uuid == obj_id:
-                        continue
-                        
-                    cur_src.execute("SELECT binarydata FROM config WHERE filename = %s;", (child_uuid,))
-                    child_row = cur_src.fetchone()
-                    if not child_row or not child_row[0]:
-                        continue
-                        
-                    potential_code = self.decompress_1c_container(child_row[0])
-                    
-                    if potential_code and any(x in potential_code for x in ['Процедура', 'Функция', 'КонецПроцедуры', 'КонецФункции', '//']):
-                        mod_type = "ObjectModule" if "ЭтотОбъект" in potential_code else "ManagerModule"
-                        
-                        cur_ai.execute("""
-                            INSERT INTO ai_source_codes (module_id, object_id, module_type, bsl_text, md5_hash)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (module_id) DO NOTHING;
-                        """, (child_uuid, obj_id, mod_type, potential_code, "legacy"))
-                        
-                        modules_found += 1
-                        
-                if idx % 100 == 0 or idx == len(objects):
-                    print(f" ⏳ Проверено объектов на наличие кода: {idx}/{len(objects)} (Найдено модулей: {modules_found})")
-                    
-        print(f"🏁 Сбор кода завершен! В СУБД ИИ успешно сохранено {modules_found} BSL-модулей.")
+            # ВЫБИРАЕМ НАПРЯМУЮ ИЗ 1С: Все файлы, которые являются модулями кода (.0 или .m)
+            # Запрос моментально отрабатывает по индексам таблицы config
+            query_all_codes = """
+                SELECT filename, binarydata 
+                FROM config 
+                WHERE filename LIKE '%.0' 
+                   OR filename LIKE '%.m'
+                   OR filename LIKE '%_demo_%.0'
+                   OR filename LIKE '%_demo_%.m';
+            """
+            try:
+                cur_src.execute(query_all_codes)
+                rows = cur_src.fetchall()
+            except Exception as e:
+                self.conn_source.rollback()
+                print(f"❌ Ошибка прямого запроса кодов к СУБД 1С: {e}")
+                return
 
+            print(f"   [Инфо] Найдено {len(rows)} бинарных файлов модулей в СУБД 1С. Начинаем распаковку...")
+
+            for idx, (filename, binarydata) in enumerate(rows, 1):
+                # Распаковываем zlib-поток (v8-deflate)
+                bsl_text_content = self.decompress_1c_container(binarydata)
+                if not bsl_text_content or not bsl_text_content.strip():
+                    continue
+                
+                # Пропускаем служебные заголовки структуры, если они случайно попали
+                if bsl_text_content.startswith('{') and ('"#" ' in bsl_text_content or '{"#' in bsl_text_content):
+                    continue
+
+                # Идентификатором кода в базе ИИ становится чистый хэш файла (логический UUID 1С)
+                clean_obj_id = str(filename).strip().replace('.0', '').replace('.m', '')
+                
+                # Подстраховка: если объект метаданных для этого кода еще не был создан на Шаге 1,
+                # мы автоматически создаем под него заглушку в ai_metadata_objects, чтобы не нарушать foreign key!
+                try:
+                    cur_ai.execute("""
+                        INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, synonym)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (object_id) DO NOTHING;
+                    """, (clean_obj_id, "CommonModule", f"Module_{clean_obj_id[:8]}", f"ОбщийМодуль_{clean_obj_id[:8]}"))
+                    
+                    # Записываем чистый BSL-код в изолированную базу ИИ
+                    cur_ai.execute("""
+                        INSERT INTO ai_source_codes (object_id, bsl_text)
+                        VALUES (%s, %s)
+                        ON CONFLICT (object_id) DO UPDATE SET bsl_text = EXCLUDED.bsl_text;
+                    """, (clean_uuid, bsl_text_content))
+                    
+                    modules_found += 1
+                except Exception as e:
+                    cur_ai.rollback()
+                    continue
+
+                if idx % 500 == 0 or idx == len(rows):
+                    # Принудительно коммитим пачками для надежности
+                    self.conn_ai.commit()
+                    print(f" ⏳ Декомпрессия модулей: {idx}/{len(rows)} (Успешно сохранено чистых BSL-файлов: {modules_found})")
+            
+            self.conn_ai.commit()
+            
+        print(f"🏁 Шаг 2 завершен! В СУБД ИИ успешно кэшировано {modules_found} чистых BSL-модулей.")
+    # ====================================================================
+    # ШАГ 3: ИЗВЛЕЧЕНИЕ РЕКВИЗИТОВ С ГЕНЕРАЦИЕЙ UUID В PYTHON
+    # ====================================================================
     def extract_and_cache_metadata_fields(self):
-        """Извлекает реквизиты/поля из 1С и кэширует в ai_metadata_fields базы ИИ"""
+        """Шаг 3: Извлекает реквизиты/поля из 1С и кэширует в ai_metadata_fields базы ИИ"""
         self.init_ai_tables()
         
         with self.conn_ai.cursor() as cursor:
             cursor.execute("SELECT object_id, object_type, internal_name FROM ai_metadata_objects;")
             objects = cursor.fetchall()
             
-        print(f"\n🚀 Запуск сканирования реквизитов и полей из 1С для {len(objects)} объектов...")
+        print(f"\n🚀 Шаг 3: Запуск сканирования реквизитов и полей из 1С для {len(objects)} объектов...")
         
         fields_found = 0
         with self.conn_source.cursor() as cur_src, self.conn_ai.cursor() as cur_ai:
             cur_ai.execute("TRUNCATE ai_metadata_fields;")
             
             for idx, (obj_id, obj_type, obj_name) in enumerate(objects, 1):
+                clean_hex = str(obj_id).replace('-', '').lower()
+                
                 if obj_type == 'Constant':
+                    gen_field_id = str(uuid.uuid4())
                     cur_ai.execute("""
-                        INSERT INTO ai_metadata_fields (object_id, field_name, field_type)
-                        VALUES (%s, %s, %s);
-                    """, (obj_id, "Значение", "ЛюбойТип"))
+                        INSERT INTO ai_metadata_fields (field_id, object_id, field_name, field_type)
+                        VALUES (%s, %s, %s, %s);
+                    """, (gen_field_id, obj_id, "Значение", "ЛюбойТип"))
                     fields_found += 1
                     continue
                 
-                cur_src.execute("SELECT binarydata FROM config WHERE filename = %s;", (obj_id,))
+                # Ищем файл структуры метаданных в 1С по окончанию хэша (обход демо-префиксов)
+                suffix_meta = f"%{clean_hex}"
+                cur_src.execute("SELECT binarydata FROM config WHERE filename LIKE %s LIMIT 1;", (suffix_meta,))
                 row = cur_src.fetchone()
                 if not row or not row[0]:
                     continue
@@ -258,13 +221,16 @@ class AIDatabaseManger:
                 if not text_container:
                     continue
                     
-                all_child_uuids = re.findall(r'[a-f0-9\-]{36}', text_container)
+                # Вытаскиваем все дочерние шестнадцатеричные строки (хэши реквизитов)
+                all_child_hexs = re.findall(r'[a-f0-9]{32}', text_container, re.IGNORECASE)
                 
-                for child_uuid in set(all_child_uuids):
-                    if child_uuid == obj_id:
+                for child_hex in set(all_child_hexs):
+                    if child_hex == clean_hex:
                         continue
                         
-                    cur_src.execute("SELECT binarydata FROM config WHERE filename = %s;", (child_uuid,))
+                    # Запрашиваем файл конкретного реквизита в СУБД 1С по LIKE
+                    suffix_child = f"%{child_hex.lower()}"
+                    cur_src.execute("SELECT binarydata FROM config WHERE filename LIKE %s LIMIT 1;", (suffix_child,))
                     child_row = cur_src.fetchone()
                     if not child_row or not child_row[0]:
                         continue
@@ -292,38 +258,32 @@ class AIDatabaseManger:
                                 f_type = "Дата"
                             elif '{"B"}' in clean_field_text or '"B"' in clean_field_text:
                                 f_type = "Булево"
+                                
+                            # Генерируем UUID в Python и делаем INSERT
+                            gen_field_id = str(uuid.uuid4())
                             cur_ai.execute("""
-                                INSERT INTO ai_metadata_fields (object_id, field_name, field_type)
-                                VALUES (%s, %s, %s);
-                            """, (obj_id, f_name, f_type)) # Передаем строго 3 аргумента под 3 знака %s
+                                INSERT INTO ai_metadata_fields (field_id, object_id, field_name, field_type)
+                                VALUES (%s, %s, %s, %s);
+                            """, (gen_field_id, obj_id, f_name, f_type))
                             fields_found += 1                                
 
                 if idx % 200 == 0 or idx == len(objects):
                     print(f" ⏳ Обработано объектов на наличие полей: {idx}/{len(objects)} (Всего полей найдено: {fields_found})")
                     
+        self.conn_ai.commit()
         print(f"🏁 Сбор полей завершен! В СУБД ИИ успешно кэшировано {fields_found} реквизитов.")
 
-    def init_ai_tables(self):
-        """Создает таблицы строго в служебной СУБД ИИ (1C_AI_Database)"""
-        with self.conn_ai.cursor() as cursor:
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS ai_metadata_objects (
-                    object_id VARCHAR(100) PRIMARY KEY,
-                    object_type VARCHAR(50),
-                    internal_name VARCHAR(255),
-                    synonym VARCHAR(255)
-                );
-                CREATE TABLE IF NOT EXISTS ai_metadata_fields (
-                    field_id SERIAL PRIMARY KEY,
-                    object_id VARCHAR(100) REFERENCES ai_metadata_objects(object_id) ON DELETE CASCADE,
-                    field_name VARCHAR(255),
-                    field_type VARCHAR(100)
-                );
-                CREATE TABLE IF NOT EXISTS ai_source_codes (
-                    module_id VARCHAR(100) PRIMARY KEY,
-                    object_id VARCHAR(100) REFERENCES ai_metadata_objects(object_id) ON DELETE CASCADE,
-                    module_type VARCHAR(50),
-                    bsl_text TEXT,
-                    md5_hash VARCHAR(32)
-                );
-            """)
+# Функция для полной сквозной синхронизации баз
+def run_full_sync():
+    manager = DBServerManager()
+    try:
+        #manager.and_cache_extract_metadata_objects()
+        #manager.extract_and_cache_metadata_objects()
+        manager.extract_and_cache_source_codes()
+        manager.extract_and_cache_metadata_fields()
+        print("\n🎉 ВСЕ ЭТАПЫ ДВУХКОНТУРНОЙ СИНХРОНИЗАЦИИ УСПЕШНО ВЫПОЛНЕНЫ!")
+    finally:
+        manager.close()
+
+if __name__ == "__main__":
+    run_full_sync()
