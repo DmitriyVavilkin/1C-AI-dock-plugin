@@ -1,441 +1,341 @@
-import zlib
 import sys
-import json
 import os
-import re
-import psycopg2
+import json
+from bsl_highlighter import BSLHighlighter
+import requests
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QSplitter, QStatusBar, QLabel, QTreeWidget, QTreeWidgetItem, 
-    QPushButton, QMessageBox, QTextEdit, QTabWidget
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QTextEdit, QPushButton, QSplitter,
+    QLabel, QLineEdit, QCheckBox, QFrame
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt
+from dbserver import DBServerManager
 
-# Безопасный импорт нашего ИИ-анализатора инцидентов
-try:
-    from error_analyzer import AIErrorAnalyzer1C
-except ImportError:
-    AIErrorAnalyzer1C = None
-
-class AI_IDE_1C(QMainWindow):
-    def __init__(self, config_path="config.json"):
+class App(QMainWindow):
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("1С ИИ-IDE: Автономный контур анализа и DevOps-автоматизации")
-        self.setMinimumSize(QSize(1280, 800))
-        self.config_path = config_path
-        self.conn_ai = None
+        self.setWindowTitle("1C:AI Hot-Fix Console (ERP Edition)")
+        self.setGeometry(100, 100, 1400, 800)
         
-        # 1. Загружаем параметры СУБД из config.json один раз при старте
-        if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"❌ Файл {self.config_path} не найден в корне проекта!")
-            
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        pg = config_data.get("postgres", {})
+        # Инициализируем наш проверенный бэкенд СУБД
+        print("[🚀] Подключение бэкенда DBServerManager к GUI...")
+        self.db = DBServerManager()
         
-        self.db_config = {
-            "host": pg.get("host", "172.16.30.204"),
-            "database": pg.get("database", "1C_AI_Database"),
-            "user": pg.get("user", "postgres"),
-            "password": pg.get("password", "Viseo193DX"),
-            "port": pg.get("port", 5432)
-        }
-        
-        # 2. Инициализируем наш ИИ-анализатор
-        if AIErrorAnalyzer1C:
-            try:
-                self.analyzer = AIErrorAnalyzer1C(config_path=self.config_path)
-            except Exception as e:
-                print(f"⚠️ Ошибка инициализации ИИ-анализатора: {e}")
-                self.analyzer = None
-        else:
-            self.analyzer = None
-        
-        self.init_ui()
-        self.load_real_tree_structure()  # Сразу строим живое дерево метаданных
-
-    def init_ui(self):
+        # Главный контейнер и разметка
         main_widget = QWidget()
-        main_layout = QHBoxLayout(main_widget)
         self.setCentralWidget(main_widget)
-
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(main_splitter)
-
-        # -------------------------------------------------------------
-        # ЛЕВАЯ ПАНЕЛЬ: Дерево метаданных (Конфигуратор)
-        # -------------------------------------------------------------
-        self.panel_left = QWidget()
-        layout_l = QVBoxLayout(self.panel_left)
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)
         
-        self.btn_sync = QPushButton("🔄 Загрузить/Обновить метаданные")
-        self.btn_sync.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        self.btn_sync.setStyleSheet("background-color: #2ecc71; color: white; padding: 8px; border-radius: 4px;")
-        self.btn_sync.clicked.connect(self.handler_sync_metadata)
-        layout_l.addWidget(self.btn_sync)
-
-        self.meta_tree = QTreeWidget()
-        self.meta_tree.setHeaderLabel("Конфигурация 1С (База ИИ)")
-        self.meta_tree.itemClicked.connect(self.handler_tree_item_clicked)
-        layout_l.addWidget(self.meta_tree)
-        main_splitter.addWidget(self.panel_left)
-
-        # -------------------------------------------------------------
-        # ЦЕНТРАЛЬНАЯ ПАНЕЛЬ: Редактор BSL и Hot-Fix
-        # -------------------------------------------------------------
-        self.panel_center = QWidget()
-        layout_c = QVBoxLayout(self.panel_center)
+        # Создаем адаптивный трехпанельный сплиттер
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(self.splitter)
         
-        self.code_tabs = QTabWidget()
-        self.txt_original_code = QTextEdit()
-        self.txt_original_code.setFont(QFont("Courier New", 10))
-        self.txt_original_code.setPlaceholderText("Здесь отобразится оригинальный BSL-код из СУБД 1С...")
+        # Инициализируем панели интерфейса
+        self.init_left_panel()
+        self.init_center_panel()
+        self.init_right_panel()
         
-        self.txt_patched_code = QTextEdit()
-        self.txt_patched_code.setFont(QFont("Courier New", 10))
-        self.txt_patched_code.setPlaceholderText("Здесь отобразится предложенный ИИ код с исправлением...")
+        # Первичное заполнение дерева объектов из базы ИИ
+        self.load_metadata_tree()
 
-        self.code_tabs.addTab(self.txt_original_code, "📄 Оригинальный BSL код")
-        self.code_tabs.addTab(self.txt_patched_code, "✨ Исправленный ИИ код (Hot-Fix)")
-        layout_c.addWidget(self.code_tabs)
-
-        self.btn_hotfix = QPushButton("🔥 Применить Hot-Fix на лету (Запись в СУБД 1С)")
-        self.btn_hotfix.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        self.btn_hotfix.setStyleSheet("background-color: #e74c3c; color: white; padding: 10px; border-radius: 4px;")
-        self.btn_hotfix.clicked.connect(self.handler_apply_hotfix)
-        layout_c.addWidget(self.btn_hotfix)
-        main_splitter.addWidget(self.panel_center)
-
-        # -------------------------------------------------------------
-        # ПРАВАЯ ПАНЕЛЬ: Интеллектуальный ИИ-Ассистент
-        # -------------------------------------------------------------
-        self.panel_right = QWidget()
-        layout_r = QVBoxLayout(self.panel_right)
+    def init_left_panel(self):
+        """Левая панель: дерево объектов метаданных"""
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         
-        ocr_layout = QHBoxLayout()
-        self.btn_ocr = QPushButton("📸 Распознать ошибку с экрана (OCR)")
-        self.btn_ocr.setStyleSheet("padding: 6px; background-color: #3498db; color: white; border-radius: 4px;")
-        self.btn_ocr.clicked.connect(self.handler_ocr_capture)
-        ocr_layout.addWidget(self.btn_ocr)
-        layout_r.addLayout(ocr_layout)
-
-        layout_r.addWidget(QLabel("💬 Ввод инцидента / Жалоба бухгалтера:"))
-        self.txt_error_input = QTextEdit()
-        self.txt_error_input.setPlaceholderText("Вставьте лог ошибки 1С или напишите суть проблемы...")
-        layout_r.addWidget(self.txt_error_input)
-
-        self.btn_analyze = QPushButton("🤖 Отправить на ИИ-Анализ")
-        self.btn_analyze.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        self.btn_analyze.setStyleSheet("background-color: #9b59b6; color: white; padding: 8px; border-radius: 4px;")
-        self.btn_analyze.clicked.connect(self.handler_analyze_incident)
-        layout_r.addWidget(self.btn_analyze)
-
-        layout_r.addWidget(QLabel("📊 Заключение ИИ-Экспертизы:"))
-        self.txt_ai_response = QTextEdit()
-        self.txt_ai_response.setReadOnly(True)
-        self.txt_ai_response.setStyleSheet("background-color: #f8f9fa;")
-        layout_r.addWidget(self.txt_ai_response)
-
-        main_splitter.addWidget(self.panel_right)
-
-        # Пропорции панелей: 20% дерево, 50% код, 30% ИИ
-        main_splitter.setSizes([250, 650, 380])
+        # Кнопка принудительной синхронизации
+        self.btn_sync = QPushButton("🔄 Синхронизировать метаданные")
+        self.btn_sync.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; padding: 6px;")
+        self.btn_sync.clicked.connect(self.load_metadata_tree)
+        left_layout.addWidget(self.btn_sync)
         
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Интерфейс инициализирован. Настройки загружены.")
-    # =============================================================
-    # РЕФАКТОРИНГ: ЕДИНАЯ ТОЧКА ПОДКЛЮЧЕНИЯ И БИЗНЕС-ЛОГИКА СУБД
-    # =============================================================
-    def _connect_db(self):
-        """Создает и возвращает новое чистое подключение к СУБД ИИ на основе настроек"""
+        # Виджет дерева с двумя колонками (вторая скрытая для internal_name)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Объекты конфигурации ERP", "Скрытое имя"])
+        self.tree.setColumnHidden(1, True)  # Прячем технические UUID файлы от глаз
+        self.tree.itemClicked.connect(self.on_tree_click)
+        left_layout.addWidget(self.tree)
+        
+        self.splitter.addWidget(left_widget)
+    def init_center_panel(self):
+        """Центральная панель: Просмотр и редактирование BSL-кода"""
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Верхний тулбар управления кодом
+        toolbar_layout = QHBoxLayout()
+        self.btn_save_local = QPushButton("💾 Сохранить локально")
+        self.btn_inject_hotfix = QPushButton("🔥 Применить Хот-Фикс в 1С")
+        self.btn_inject_hotfix.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        
+        toolbar_layout.addWidget(self.btn_save_local)
+        toolbar_layout.addWidget(self.btn_inject_hotfix)
+        center_layout.addLayout(toolbar_layout)
+        
+        # Основной текстовый редактор кода
+        self.editor = QTextEdit()
+        self.highlighter = BSLHighlighter(self.editor.document())
+        self.editor.setPlaceholderText("Выберите модуль из дерева слева для отображения BSL-кода...")
+        self.editor.setStyleSheet("font-family: 'Courier New'; font-size: 11pt; background-color: #ffffff;")
+        center_layout.addWidget(self.editor)
+        
+        # Кнопка быстрой отправки выделенного фрагмента в ИИ
+        self.btn_analyze_fragment = QPushButton("🔍 Отправить выделенный код на анализ ИИ")
+        self.btn_analyze_fragment.clicked.connect(self.send_fragment_to_chat)
+        center_layout.addWidget(self.btn_analyze_fragment)
+        
+        self.splitter.addWidget(center_widget)
+
+    def load_metadata_tree(self):
+        """Построение наглядного дерева в стиле Конфигуратора 1С (Класс -> Объект -> Реквизиты/Модули)"""
+        print("[🔄] GUI: Построение иерархического дерева Конфигуратора...")
+        self.tree.clear()
+        
+        cursor = self.db.conn_ai.cursor()
         try:
-            return psycopg2.connect(**self.db_config)
-        except Exception as e:
-            self.statusBar.showMessage(f"❌ Ошибка подключения к базе ИИ: {e}")
-            raise e
-
-    # =============================================================
-    # ЛОГИКА И МЕТОДЫ РАБОТЫ С СУБД И ИИ (УНИВЕРСАЛЬНОЕ ДЕРЕВО)
-    # =============================================================
-    def load_real_tree_structure(self):
-        """Считывает структуру метаданных, автоматически создает папки под любые типы 1С и строит дерево"""
-        self.meta_tree.clear()
-        
-        try:
-            conn = self._connect_db()
-            with conn.cursor() as cur:
-                # Берем все объекты метаданных, у которых есть тип
-                query = """
-                    SELECT object_id, object_type, COALESCE(synonym, internal_name) as display_name 
-                    FROM ai_metadata_objects 
-                    WHERE object_type IS NOT NULL 
-                    ORDER BY object_type, display_name;
-                """
-                cur.execute(query)
-                rows = cur.fetchall()
-            conn.close()
-
-            # Предопределенные русские названия для базовых папок 1С
-            folder_mapping = {
-                "Constant": "Константы",
-                "Catalog": "Справочники",
-                "Document": "Документы",
-                "CommonModule": "Общие Модули",
-                "Commonmodules": "Общие Модули",  # Подстраховка регистра
-                "DataProcessor": "Обработки",
-                "InformationRegister": "Регистры Сведений",
-                "AccumulationRegister": "Регистры Накопления"
-            }
-
-            # Сюда будем складывать созданные корневые узлы дерева
-            root_nodes = {}
-
-            # Наполняем ветки реальными синонимами
-            for obj_id, obj_type, display_name in rows:
-                # Если папка для такого типа еще не создана — создаем её на лету!
-                if obj_type not in root_nodes:
-                    # Ищем красивое русское имя в маппинге, иначе берем имя типа из базы
-                    folder_title = folder_mapping.get(obj_type, f"Тип: {obj_type}")
-                    root_nodes[obj_type] = QTreeWidgetItem(self.meta_tree, [folder_title])
-                
-                raw_name = str(display_name).strip()
-                
-                # Очищаем системные префиксы СУБД 1С, если они есть
-                clean_name = re.sub(r'^_const|^_reference|^_document|^_accumreg|^_inforeg', '', raw_name, flags=re.IGNORECASE).strip('_')
-                if not clean_name:
-                    clean_name = raw_name
-                
-                # Если имя объекта осталось техническим, убираем системные слова для читаемости
-                for pattern in ['reference', 'document', 'const', 'module']:
-                    if clean_name.lower().startswith(pattern):
-                        clean_name = clean_name[len(pattern):].strip('_')
-                
-                # Если после всех чисток строка пустая или остался только хеш, добавим тип для понятности
-                if not clean_name or len(clean_name) <= 4:
-                    clean_name = f"{obj_type} ({str(obj_id)[:4]})"
-                else:
-                    clean_name = clean_name.capitalize()
-                
-                # Добавляем объект в соответствующую папку
-                child_item = QTreeWidgetItem(root_nodes[obj_type], [clean_name])
-                child_item.setData(0, Qt.ItemDataRole.UserRole, obj_id)
-
-            self.statusBar.showMessage(f"📊 Успешно загружено {len(rows)} объектов из СУБД ИИ (Динамические папки созданы).")
-
-        except Exception as e:
-            self.statusBar.showMessage(f"❌ Ошибка СУБД при чтении дерева: {e}")
-
-    def handler_tree_item_clicked(self, item, column):
-        """При клике на конкретный объект вытягивает его BSL-код из СУБД ИИ и распаковывает из формата 1С"""
-        obj_name = item.text(0)
-        obj_id = item.data(0, Qt.ItemDataRole.UserRole)
-        
-        if item.parent() and obj_id:
-            self.statusBar.showMessage(f"📖 Чтение и декомпрессия BSL-кода для '{obj_name}'...")
-            
-            try:
-                conn = self._connect_db()
-                with conn.cursor() as cur:
-                    cur.execute("SELECT bsl_text FROM ai_source_codes WHERE object_id = %s LIMIT 1;", (obj_id,))
-                    row = cur.fetchone()
-                conn.close()
-
-                if row and row[0]:
-                    raw_data = row[0]
-                    clean_bsl_text = None
-                    
-                    # 🛠 РАСПАКОВКА НА ЛЕТУ: Если данные пришли в виде байт-строки или сырого контейнера 1С
-                    try:
-                        # Проверяем, если это байты или строка, похожая на сжатый поток
-                        byte_data = raw_data if isinstance(raw_data, bytes) else raw_data.encode('utf-8-sig', errors='ignore')
-                        
-                        # Пробуем стандартный raw deflate 1С (wbits=-15)
-                        decompressed = zlib.decompress(byte_data, -zlib.MAX_WBITS)
-                        clean_bsl_text = decompressed.decode('utf-8-sig', errors='ignore')
-                    except Exception:
-                        try:
-                            # Пробуем обычный zlib
-                            clean_bsl_text = zlib.decompress(byte_data).decode('utf-8-sig', errors='ignore')
-                        except Exception:
-                            # Если это уже строка (например, заголовок), оставляем как есть
-                            clean_bsl_text = str(raw_data)
-
-                    # Выводим в редактор читаемый текст
-                    self.txt_original_code.setPlainText(clean_bsl_text)
-                    self.statusBar.showMessage(f"✅ Модуль '{obj_name}' успешно декомпрессирован.")
-                else:
-                    self.txt_original_code.setPlainText("// Исходный код модуля для данного объекта пуст.")
-                    self.statusBar.showMessage(f"⚠️ Для объекта '{obj_name}' текст модуля пуст.")
-                    
-            except Exception as e:
-                self.statusBar.showMessage(f"❌ Ошибка загрузки кода: {e}")
-
-    def handler_analyze_incident(self):
-        """Интеграция с бэкендом: передает лог ошибки в отлаженный error_analyzer.py"""
-        error_text = self.txt_error_input.toPlainText()
-        if not error_text.strip():
-            QMessageBox.warning(self, "Внимание", "Поле ввода проблемы пустое. Напишите жалобу или вставьте стек ошибки.")
-            return
-            
-        if not self.analyzer:
-            QMessageBox.critical(self, "Ошибка бэкенда", "Класс AIErrorAnalyzer1C не инициализирован. Проверьте error_analyzer.py.")
-            return
-
-        self.statusBar.showMessage("🤖 Роутер распределяет задачу. Локальная LLM формирует технический ответ...")
-        QApplication.processEvents()
-        
-        try:
-            result = self.analyzer.dispatch_and_analyze(error_text)
-            self.txt_ai_response.setPlainText(result)
-            
-            # Автозахват кода: если ИИ сгенерировал код исправления, вставляем во вторую вкладку
-            if "```" in result:
-                code_blocks = re.findall(r'```(?:bsl|1c)?(.*?)```', result, re.DOTALL)
-                if code_blocks and len(code_blocks) > 0:
-                    clean_patch = code_blocks[0].strip()
-                    if clean_patch:
-                        self.txt_patched_code.setPlainText(clean_patch)
-                        self.code_tabs.setCurrentIndex(1)  # Переключаем на вкладку Хот-Фикса
-                    
-            self.statusBar.showMessage("📊 Анализ инцидента завершен. Код исправления передан в редактор.")
-        except Exception as e:
-            self.txt_ai_response.setPlainText(f"❌ Ошибка в процессе ИИ-экспертизы: {e}")
-            self.statusBar.showMessage("❌ Сбой выполнения ИИ-анализа.")
-
-    def handler_sync_metadata(self):
-        """Заглушка полной пересинхронизации баз"""
-        self.statusBar.showMessage("⏳ Синхронизация данных... Чтение метаданных напрямую из SQL 1С...")
-        QApplication.processEvents()
-        QMessageBox.information(self, "Синхронизация", "Синхронизация запущена. Дерево метаданных будет перестроено.")
-        self.load_real_tree_structure()
-
-    def handler_apply_hotfix(self):
-        """Интерактивный пульт применения изменений в живую базу СУБД 1С через HotFixManager1C"""
-        patched_code = self.txt_patched_code.toPlainText()
-        if not patched_code.strip():
-            QMessageBox.warning(self, "Внимание", "В окне Hot-Fix нет исправленного кода для отправки.")
-            return
-
-        reply = QMessageBox.question(
-            self, 'КРИТИЧЕСКАЯ ОПЕРАЦИЯ: ЖИВОЙ ПАТЧ СУБД',
-            "Вы уверены, что хотите применить этот Hot-Fix и переписать код модуля напрямую в СУБД рабочей базы 1С?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.statusBar.showMessage("🔥 Выполнение SQL-инъекции патча в СУБД 1С...")
-            QMessageBox.information(self, "Успех", "Патч успешно применен! Модуль обновлен в конфигурации 1С.")
-            self.statusBar.showMessage("🎯 Модуль успешно обновлен в СУБД 1С.")
-
-    def handler_ocr_capture(self):
-        """Заглушка OCR"""
-        QMessageBox.information(self, "OCR Модуль", "Здесь мы подключим mss + EasyOCR для автоматического распознавания ошибок с экрана.")
-
-# =====================================================================
-# ДИНАМИЧЕСКИЙ ПАТЧ ДЛЯ ИНТЕРФЕЙСА (ПИШЕТСЯ У ЛЕВОГО КРАЯ - 0 ПРОБЕЛОВ)
-# =====================================================================
-def inject_fixed_gui_logic(main_window_instance):
-    """
-    Переопределяет методы загрузки дерева и клика в app.py 
-    под реальную схему таблиц 1C_AI_Database.
-    """
-    print("[🎨] Накатывание интерфейсного хот-фикса на app.py...")
-    
-    # Ссылаемся на наш экземпляр менеджера СУБД, который используется в приложении
-    # Предполагаем, что внутри главного окна он сохранен в self.db или self.db_manager
-    db_manager = getattr(main_window_instance, 'db', None) or getattr(main_window_instance, 'db_manager', None)
-    
-    if not db_manager:
-        print("[⚠️] Не удалось автоматически найти объект DBServerManager внутри вашего окна.")
-        return
-
-    # 1. ПЕРЕОПРЕДЕЛЯЕМ МЕТОД ЗАПОЛНЕНИЯ ДЕРЕВА
-    def fixed_load_tree_data():
-        print("[🔄] GUI запрашивает структуру метаданных для дерева...")
-        # Очищаем старое дерево (замените self.treeWidget на ваше имя виджета дерева)
-        tree_widget = getattr(main_window_instance, 'treeWidget', None) or getattr(main_window_instance, 'tree', None)
-        if not tree_widget:
-            return
-        
-        tree_widget.clear()
-        
-        # Берем открытый коннект ИИ из нашего бэкенда
-        cursor = db_manager.conn_ai.cursor()
-        try:
-            # Выбираем точные поля: тип, синоним для отображения и internal_name для связи с кодом
-            cursor.execute("SELECT object_type, synonym, internal_name FROM ai_metadata_objects;")
+            # Читаем структуру объектов метаданных из базы ИИ
+            cursor.execute("""
+                SELECT object_type, synonym, internal_name, object_id 
+                FROM ai_metadata_objects 
+                WHERE internal_name IN (SELECT code_filename FROM ai_metadata_source_codes);
+            """)
             rows = cursor.fetchall()
             
-            # Собираем категории в дереве
-            categories = {}
-            from PyQt6.QtWidgets import QTreeWidgetItem
+            root_folders = {}  # Главные ветки Конфигуратора: "Общие модули", "Документы", "Справочники"
+            object_nodes = {}  # Конкретные объекты: "ЗаказКлиента", "Номенклатура"
             
-            for obj_type, synonym, internal_name in rows:
-                if not obj_type:
-                    obj_type = "ПрочиеМодули"
-                if obj_type not in categories:
-                    parent_item = QTreeWidgetItem(tree_widget, [obj_type])
-                    categories[obj_type] = parent_item
+            from PyQt6.QtWidgets import QTreeWidgetItem
+            from PyQt6.QtGui import QFont, QColor
+            
+            bold_font = QFont()
+            bold_font.setBold(True)
+            
+            # Предмаппинг типов для точного соответствия дереву Конфигуратора 1С
+            type_mapping = {
+                "ОбщиеМодули": "Общие модули",
+                "МодулиДокументов": "Документы",
+                "МодулиСправочников": "Справочники",
+                "Шаблоны и макеты отчетов": "Отчеты (Макеты)",
+                "ПрочиеОбъекты": "Прочие объекты"
+            }
+            
+            for obj_type, synonym, internal_name, object_id in rows:
+                # Мапим внутренний тип на красивое имя ветки Конфигуратора
+                display_type = type_mapping.get(obj_type, "Общие модули")
                 
-                # Создаем дочерний узел: на экран выводим Синоним, а имя файла прячем в скрытую колонку или роль
-                child_item = QTreeWidgetItem(categories[obj_type], [synonym])
-                # Сохраняем имя файла (internal_name) во вторую скрытую колонку (индекс 1) для обработчика клика
-                child_item.setText(1, internal_name)
+                # Шаг 1: Создаем корневую папку класса 1С (например, "Документы"), если её еще нет
+                if display_type not in root_folders:
+                    root_item = QTreeWidgetItem(self.tree, [display_type])
+                    root_item.setFont(0, bold_font)
+                    root_folders[display_type] = root_item
                 
-            print(f"[✅] Дерево GUI успешно перестроено. Отображено категорий: {len(categories)}")
+                # Очищаем синоним от технических суффиксов
+                clean_synonym = synonym.replace(" (Менеджер)", "").replace(" (Объект)", "").strip()
+                
+                # Если синоним слишком длинный (например, текст отчета Росстата), аккуратно сокращаем его для имени папки
+                if len(clean_synonym) > 30:
+                    import re
+                    short_match = re.split(r'[,.\s:\-]', clean_synonym)
+                    if short_match and len(short_match) > 2:
+                        base_obj_name = " ".join(short_match[:3]).strip()
+                    else:
+                        base_obj_name = clean_synonym[:25] + "..."
+                else:
+                    base_obj_name = clean_synonym
+                
+                # Уникальный ключ объекта внутри его класса (например, "Документы_ЗаказКлиента")
+                obj_key = f"{display_type}_{base_obj_name}"
+                
+                # Шаг 2: Если это объектный класс (Документы/Справочники), создаем для него отдельную подпапку
+                if display_type in ["Документы", "Справочники", "Отчеты (Макеты)"]:
+                    if obj_key not in object_nodes:
+                        obj_item = QTreeWidgetItem(root_folders[display_type], [base_obj_name])
+                        object_nodes[obj_key] = obj_item
+                        
+                        # 🔍 Шаг 2.1: Выводим папку "Реквизиты" внутри объекта (как в 1С)
+                        if object_id:
+                            attr_cursor = self.db.conn_ai.cursor()
+                            try:
+                                attr_cursor.execute("SELECT attribute_name, attribute_type FROM ai_cached_attributes WHERE object_uuid = %s;", (object_id,))
+                                attributes = attr_cursor.fetchall()
+                                if attributes:
+                                    req_folder = QTreeWidgetItem(obj_item, ["Реквизиты"])
+                                    req_folder.setForeground(0, QColor("#b8860b"))  # Золотисто-коричневый цвет реквизитов 1С
+                                    for attr_name, attr_type in attributes:
+                                        QTreeWidgetItem(req_folder, [f"🔹 {attr_name} ({attr_type})"])
+                            except Exception:
+                                pass
+                            finally:
+                                attr_cursor.close()
+                    
+                    # Целевой родитель для листочка модуля — папка этого объекта
+                    current_parent = object_nodes[obj_key]
+                else:
+                    # Для общих модулей промежуточная папка объекта не нужна, кладем сразу в корень класса
+                    current_parent = root_folders[display_type]
+                
+                # Шаг 3: Формируем имя листочка исполняемого файла
+                if internal_name.endswith('.m'):
+                    module_label = "📄 Модуль менеджера"
+                elif display_type == "Отчеты (Макеты)":
+                    module_label = f"📊 Макет: {synonym[:30]}..." if len(synonym) > 30 else f"📊 Макет: {synonym}"
+                else:
+                    module_label = "📄 Модуль объекта"
+                    
+                # Добавляем модуль в дерево
+                module_item = QTreeWidgetItem(current_parent, [module_label])
+                # Скрываем internal_name (uuid.0/.m) во вторую колонку для обработки клика
+                module_item.setText(1, internal_name)
+                
+            print(f"[✅] Иерархическое дерево Конфигуратора 1С успешно построено в GUI.")
         except Exception as e:
-            print(f"[❌] Ошибка заполнения дерева в GUI: {e}")
+            print(f"[❌] Ошибка дерева Конфигуратора: {e}")
         finally:
             cursor.close()
 
-    # 2. ПЕРЕОПРЕДЕЛЯЕМ МЕТОД КЛИКА ПО ДЕРЕВУ
-    def fixed_on_item_clicked(item, column):
-        # Если кликнули по родительской категории, у которой нет скрытого имени файла, ничего не делаем
-        internal_name = item.text(1)
+    def on_tree_click(self, item, column):
+        """Обработчик клика по элементу дерева — загрузка чистого BSL-кода"""
+        internal_name = item.text(1)  # Забираем скрытое имя файла из колонки 1
         if not internal_name:
             return
             
-        print(f"[🖱️] Клик по объекту дерева. Запрос кода для файла: {internal_name}")
+        print(f"[🖱️] Клик в GUI. Запрос BSL-кода для: {internal_name}")
         
-        # Получаем виджет текстового редактора кода (замените на имя вашего QTextEdit)
-        code_editor = getattr(main_window_instance, 'codeEditor', None) or getattr(main_window_instance, 'textEdit', None) or getattr(main_window_instance, 'code_edit', None)
-        
-        if not code_editor:
-            print("[⚠️] Не найден виджет текстового редактора в главном окне.")
-            return
-            
-        cursor = db_manager.conn_ai.cursor()
+        cursor = self.db.conn_ai.cursor()
         try:
-            # Запрос в нашу новую изолированную таблицу кодов по code_filename
+            # Читаем чистый декомпрессированный код из нашей новой таблицы
             cursor.execute("SELECT source_code FROM ai_metadata_source_codes WHERE code_filename = %s;", (internal_name,))
             result = cursor.fetchone()
             
             if result and result[0]:
-                code_editor.setPlainText(result[0])
-                print(f"[✅] Чистый BSL-код модуля успешно выведен на экран ({len(result[0])} симв.)")
+                self.editor.setPlainText(result[0])
+                print(f"[✅] Код модуля {internal_name} успешно выведен в редактор.")
             else:
-                code_editor.setPlainText(f"// Исходный код для модуля {internal_name} не найден в базе ИИ.")
+                self.editor.setPlainText(f"// Исходный BSL-код для модуля {internal_name} не найден в базе ИИ.")
         except Exception as e:
             print(f"[❌] Ошибка загрузки кода в редактор: {e}")
+            self.editor.setPlainText(f"// Ошибка при обращении к базе ИИ: {e}")
         finally:
             cursor.close()
 
-    # Привязываем наши новые исправленные функции к экземпляру окна
-    # Замените 'load_tree' и 'on_tree_click' на реальные имена ваших методов в app.py
-    if hasattr(main_window_instance, 'load_tree'):
-        main_window_instance.load_tree = fixed_load_tree_data
-    if hasattr(main_window_instance, 'on_tree_click'):
-        main_window_instance.on_tree_click = fixed_on_item_clicked
+    def send_fragment_to_chat(self):
+        """Перенос выделенного текста в поле ввода ИИ-чата"""
+        selected_text = self.editor.textCursor().selectedText()
+        if selected_text:
+            current_prompt = self.chat_input.toPlainText()
+            self.chat_input.setPlainText(f"{current_prompt}\nИсходный фрагмент кода:\n{selected_text}\n")
+    def init_right_panel(self):
+        """Правая панель: ИИ-пульт управления инцидентами и генератор патчей"""
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         
-    # Сразу вызываем обновление дерева, чтобы перерисовать интерфейс красивыми синонимами
-    fixed_load_tree_data()
+        # Информационная плашка подключения к модели
+        active_model = self.db.config.get("local_llm", {}).get("model_name", "qwen2.5-coder-7b-instruct")
+        model_label = QLabel(f"🤖 Локальная LLM: {active_model}")
+                
+        #model_label = QLabel("🤖 Локальная LLM: qwen2.5-coder-7b-instruct")
+        model_label.setStyleSheet("font-weight: bold; color: #2c3e50; padding: 4px;")
+        right_layout.addWidget(model_label)
+        
+        # Окно истории диалога с ИИ
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setPlaceholderText("Здесь будет отображаться лог анализа и сгенерированные Хот-Фиксы...")
+        self.chat_history.setStyleSheet("background-color: #f8f9fa; font-family: 'Consolas';")
+        right_layout.addWidget(self.chat_history)
+        
+        # Поле ввода промпта/задачи для ИИ
+        self.chat_input = QTextEdit()
+        self.chat_input.setMaximumHeight(100)
+        self.chat_input.setPlaceholderText("Опишите задачу или инцидент (например: 'Оптимизируй этот запрос' или 'Почему здесь падает расчет?')...")
+        right_layout.addWidget(self.chat_input)
+        
+        # Кнопка отправки запроса в ИИ
+        self.btn_send_ai = QPushButton("⚡ Сгенерировать Хот-Фикс / Найти ошибку")
+        self.btn_send_ai.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold; padding: 8px;")
+        self.btn_send_ai.clicked.connect(self.ask_local_ai)
+        right_layout.addWidget(self.btn_send_ai)
+        
+        self.splitter.addWidget(right_widget)
 
+    def ask_local_ai(self):
+        """Отправка текущего BSL-кода и промпта разработчика в Qwen2.5-Coder по настройкам из config.json"""
+        user_prompt = self.chat_input.toPlainText().strip()
+        if not user_prompt:
+            return
+            
+        current_code = self.editor.toPlainText().strip()
+        
+        self.chat_history.append(f"\n👤 Разработчик:\n{user_prompt}")
+        self.chat_input.clear()
+        QApplication.processEvents()  # Мгновенно обновляем интерфейс
+        
+        # 🔥 ИЗВЛЕКАЕМ НАСТРОЙКИ ИЗ CONFIG.JSON 🔥
+        llm_config = self.db.config.get("local_llm", {})
+        base_url = llm_config.get("api_url", "http://172.21.0.179:1234/v1").rstrip('/')
+        url = f"{base_url}/chat/completions"  # Идеально склеиваем эндпоинт
+        
+        model_name = llm_config.get("model_name", "qwen2.5-coder-7b-instruct")
+        request_timeout = llm_config.get("timeout", 120)
+        
+        print(f"[🤖] Запрос к ИИ: {url} | Модель: {model_name} | Таймаут: {request_timeout}с")
+        
+        system_content = (
+            "Ты — ведущий эксперт по разработке, оптимизации и исправлению ошибок в среде 1С:Предприятие 8 (ERP). "
+            "Отвечай на русском языке. Если тебя просят написать или исправить код, выдавай готовый, чистый BSL-код "
+            "с комментариями, что именно изменено. Будь краток и точен."
+        )
+        
+        user_content = f"Задача/Вопрос: {user_prompt}\n\nТекущий контекст BSL-кода модуля:\n```bsl\n{current_code}\n```"
+        
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.2
+        }
+        
+        self.chat_history.append(f"\n🤖 ИИ ({model_name}): Думаю над решением инцидента...")
+        QApplication.processEvents()
+        
+        try:
+            # Отправляем запрос с таймаутом из конфига
+            response = requests.post(url, json=payload, timeout=request_timeout)
+            if response.status_code == 200:
+                result = response.json()
+                ai_reply = result['choices']['message']['content']
+                self.chat_history.append(f"\n🤖 ИИ (Решение):\n{ai_reply}")
+            else:
+                self.chat_history.append(f"\n❌ Ошибка сервера ИИ (Код {response.status_code}): {response.text}")
+        except Exception as e:
+            self.chat_history.append(f"\n❌ Не удалось достучаться до ИИ-сервера по адресу {url}: {e}")
+            
+        self.chat_history.ensureCursorVisible()
+
+    def closeEvent(self, event):
+        """Безопасное закрытие подключений СУБД при закрытии окна крестиком"""
+        print("[🔒] Закрытие GUI. Вызов деструктора подключений...")
+        if hasattr(self, 'db') and self.db:
+            self.db.close()
+        event.accept()
+
+# =====================================================================
+# ТОЧКА ЗАПУСКА ПРИЛОЖЕНИЯ PYQT6 (СТОИТ У ЛЕВОГО КРАЯ - 0 ПРОБЕЛОВ)
+# =====================================================================
 if __name__ == "__main__":
-    app = QApplication([])
-    window = AI_IDE_1C() # Имя вашего класса окна
-    # 🔥 ВСТАВЛЯЕМ НАШУ ВЫЗОВ СЮДА ПЕРЕД НАЧАЛОМ РАБОТЫ ОКНА:
-    inject_fixed_gui_logic(window)
-    window.show()
-    app.exec()
+    # Настройка масштабирования для экранов с высоким разрешением (4K/FullHD)
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    
+    app = QApplication(sys.argv)
+    
+    # Запускаем наше полностью обновленное приложение
+    console_app = App()
+    console_app.show()
+    
+    sys.exit(app.exec())

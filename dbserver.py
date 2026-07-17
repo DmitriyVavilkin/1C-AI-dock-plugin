@@ -78,6 +78,18 @@ class DBServerManager:
                     meta_data JSONB
                 );
             """)
+            
+            cursor.execute("""     
+                 CREATE TABLE IF NOT EXISTS ai_hotfix_history (
+                    patch_id UUID PRIMARY KEY,
+                    target_filename VARCHAR(255),       -- имя файла в config (например, uuid.0)
+                    original_binary_backup BYTEA,       -- СЫРОЙ бинарник 1С до исправления (для отката)
+                    patch_bsl_code TEXT,                -- чистый BSL-код, который внедрил ИИ
+                    developer_comment TEXT,             -- описание инцидента / промпт
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_rolled_back BOOLEAN DEFAULT FALSE
+                );
+            """)
             self.conn_ai.commit()
             print("[✅] Служебные таблицы в базе 1C_AI_Database успешно проверены/созданы.")
         except Exception as e:
@@ -218,16 +230,16 @@ class DBServerManager:
             cursor_1c.close()
             cursor_ai.close()
     def extract_and_cache_source_codes(self):
-         #   """
-         #   Шаг 2.2: Массовое скачивание, декомпрессия модулей .0 и .m из config 
-         #   и наполнение таблицы кодов в базе ИИ.
-         #   """
-        print("[🔄] Шаг 2: Старт извлечения текстов BSL-кода из config 1С...")
+        """
+        Шаг 2.2 (Интеллектуальный): Разделение BSL-кода и шаблонов/макетов 1С.
+        Вытаскивает названия форм Росстата и относит их к правильному родителю в дереве.
+        """
+        print("[🔄] Шаг 2: Глубокий анализ config 1С и категоризация объектов...")
         
         cursor_1c = self.conn_1c.cursor()
-        cursor_ai = self.conn_ai.cursor()
         
-        # Гарантируем наличие таблицы для чистого BSL-кода с правильными колонками
+        # Гарантируем структуру таблиц
+        cursor_ai = self.conn_ai.cursor()
         cursor_ai.execute("""
             CREATE TABLE IF NOT EXISTS ai_metadata_source_codes (
                 id UUID PRIMARY KEY,
@@ -245,7 +257,7 @@ class DBServerManager:
         try:
             cursor_1c.execute(query_1c)
             records = cursor_1c.fetchall()
-            print(f"[📊] В таблице config 1С найдено {len(records)} сжатых BSL-модулей.")
+            print(f"[📊] В таблице config 1С найдено {len(records)} потенциальных объектов.")
             
             codes_cached = 0
             
@@ -258,41 +270,99 @@ class DBServerManager:
                 try:
                     # Декомпрессия сырого deflate
                     raw_data = zlib.decompress(bytes(binarydata), -zlib.MAX_WBITS)
-                    # Декодируем в текст и вырезаем нулевые байты
-                    source_code = raw_data.decode('utf-8-sig', errors='ignore').replace('\x00', '')
+                    text_content = raw_data.decode('utf-8-sig', errors='ignore').replace('\x00', '')
                     
-                    # Пишем в изолированную таблицу через upsert
-                    cursor_ai = self.conn_ai.cursor()
-                    try:
-                        query_ai = """
-                            INSERT INTO ai_metadata_source_codes (id, code_filename, source_code)
-                            VALUES (%s, %s, %s)
-                            ON CONFLICT (code_filename) 
-                            DO UPDATE SET source_code = EXCLUDED.source_code, updated_at = CURRENT_TIMESTAMP;
-                        """
-                        ai_id = str(uuid.uuid4())
-                        cursor_ai.execute(query_ai, (ai_id, filename_lower, source_code))
-                        self.conn_ai.commit() 
-                        codes_cached += 1
-                    except Exception as transaction_error:
-                        self.conn_ai.rollback()
-                        print(f"[⚠️] Пропущена запись {filename} при записи в БД ИИ: {transaction_error}")
-                    finally:
-                        cursor_ai.close()
+                    pure_bsl_code = ""
+                    friendly_name = f"Объект: {filename_lower[:8]}"
+                    object_type = "ПрочиеОбъекты"
                     
+                    # --- СЦЕНАРИЙ А: Это структурный шаблон/макет (как на скриншоте) ---
+                    if "ФЕДЕРАЛЬНОЕ СТАТИСТИЧЕСКОЕ НАБЛЮДЕНИЕ" in text_content or '{"ru","' in text_content:
+                        object_type = "Шаблоны и макеты отчетов"
+                        
+                        # Вытаскиваем самое длинное русское наименование отчета Росстата из структуры {"ru","..."}
+                        ru_names = re.findall(r'{"ru",\s*"([^"]+)"}', text_content)
+                        if ru_names:
+                            # Берем самое длинное и содержательное имя (чтобы отсечь технические маркеры)
+                            friendly_name = max(ru_names, key=len)
+                        else:
+                            friendly_name = f"Шаблон отчета {filename_lower[:8]}"
+                            
+                        # Для макетов сохраняем текст структуры как есть, чтобы его можно было изучать
+                        pure_bsl_code = text_content
+                        
+                    # --- СЦЕНАРИЙ Б: Это реальный исполняемый BSL-код ---
+                    else:
+                        if text_content.strip().startswith("{"):
+                            string_blocks = re.findall(r'"((?:[^"\\]|\\.)*)"', text_content, re.DOTALL)
+                            best_block = ""
+                            for block in string_blocks:
+                                if "Процедура " in block or "Функция " in block or "КонецПроцедуры" in block:
+                                    if len(block) > len(best_block):
+                                        best_block = block
+                            if best_block:
+                                pure_bsl_code = best_block.replace('\\"', '"').replace('""', '"')
+                        else:
+                            if "Процедура " in text_content or "Функция " in text_content:
+                                pure_bsl_code = text_content
+                                
+                        if pure_bsl_code:
+                            # Отрезаем бинарный заголовок смещений
+                            match_start = re.search(r'(//|#Область|Процедура|Функция|Перем)', pure_bsl_code, re.IGNORECASE)
+                            if match_start:
+                                pure_bsl_code = pure_bsl_code[match_start.start():]
+                                
+                            # Определяем родителя для кода
+                            object_type = "ОбщиеМодули"
+                            biz_name = re.search(r'Функция\s+([A-Za-zА-Яа-я0-9_]+)', pure_bsl_code)
+                            if biz_name:
+                                friendly_name = biz_name.group(1)
+                                if "Документ" in pure_bsl_code or "ПередачаТоваров" in pure_bsl_code:
+                                    object_type = "МодулиДокументов"
+                                    
+                            if filename_lower.endswith('.m'):
+                                friendly_name = f"{friendly_name} (Менеджер)"
+                            else:
+                                friendly_name = f"{friendly_name} (Объект)"
+
+                    # Записываем результаты в базу ИИ через изолированные транзакции
+                    if pure_bsl_code.strip():
+                        cursor_save = self.conn_ai.cursor()
+                        try:
+                            # 1. Обновляем текст/структуру
+                            cursor_save.execute("""
+                                INSERT INTO ai_metadata_source_codes (id, code_filename, source_code)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (code_filename) 
+                                DO UPDATE SET source_code = EXCLUDED.source_code, updated_at = CURRENT_TIMESTAMP;
+                            """, (str(uuid.uuid4()), filename_lower, pure_bsl_code))
+                            
+                            # 2. Перепривязываем к правильному родителю и пишем красивый Синоним
+                            cursor_save.execute("""
+                                INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, synonym, sql_table_name)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (internal_name) 
+                                DO UPDATE SET synonym = EXCLUDED.synonym, object_type = EXCLUDED.object_type;
+                            """, (str(uuid.uuid4()), object_type, filename_lower, friendly_name, "ERP_PROCESSED"))
+                            
+                            self.conn_ai.commit()
+                            codes_cached += 1
+                        except Exception:
+                            self.conn_ai.rollback()
+                        finally:
+                            cursor_save.close()
+                            
                 except zlib.error:
-                    continue  # Пропускаем файлы, если они не в формате deflate
-                except Exception as e:
-                    print(f"[⚠️] Ошибка обработки файла {filename} на стороне Python: {e}")
+                    continue
+                except Exception:
                     continue
             
-            print(f"[✅] Наполнение базы ИИ завершено! Успешно сохранено чистым BSL-кодом: {codes_cached} модулей.")
+            print(f"[✅] Категоризация завершена! Распределено по родителям: {codes_cached} объектов.")
             
         except Exception as e:
-            print(f"[💥] Критическая ошибка при чтении исходных кодов из 1С: {e}")
+            print(f"[💥] Ошибка: {e}")
         finally:
             cursor_1c.close()
-
 
     def close(self):
         """Безопасное закрытие пула соединений при уничтожении объекта"""
