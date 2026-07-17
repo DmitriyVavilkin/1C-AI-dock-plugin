@@ -106,132 +106,6 @@ class DBServerManager:
     # ШАГ 1 И ШАГ 2: ИЗВЛЕЧЕНИЕ ОБЪЕКТОВ И НАСТОЯЩЕГО BSL-КОДА
     # ====================================================================
 
-def sync_metadata_structure(self):
-    #"""
-    #Парсинг структуры метаданных конфигурации 1С из таблицы config 
-    #и ее сохранение в базу данных 1C_AI_Database.
-    #"""
-    print("[🔄] Шаг 1: Запуск парсинга структуры метаданных конфигурации 1С...")
-    
-    # Инициализируем подключения к двум базам данных
-     try:
-        conn_1c = self._connect_db()  # Подключение к рабочей СУБД 1С (Источник)
-        conn_ai = self._connect_db()  # Подключение к 1C_AI_Database (Цель)
-     except Exception as e:
-        print(f"[❌] Ошибка инициализации подключений к СУБД: {e}")
-        return
-
-     cursor_1c = conn_1c.cursor()
-     cursor_ai = conn_ai.cursor()
-    
-     # Создаем целевую таблицу ai_metadata_objects в базе ИИ, если её нет
-     cursor_ai.execute("""
-        CREATE TABLE IF NOT EXISTS ai_metadata_objects (
-            id UUID PRIMARY KEY,
-            filename VARCHAR(255) UNIQUE,
-            object_name VARCHAR(255),
-            object_type VARCHAR(100),
-            logical_uuid VARCHAR(50),
-            source_code TEXT,
-            is_active BOOLEAN DEFAULT TRUE
-        );
-     """)
-     conn_ai.commit()
-    
-     # Читаем главные файлы конфигурации: 'root', 'metadata' и UUID-файлы описания классов
-     query_1c = "SELECT filename, binarydata FROM config WHERE filename IN ('root', 'metadata') OR filename LIKE '__________-____-____-____-____________';"
-    
-     try:
-        cursor_1c.execute(query_1c)
-        records = cursor_1c.fetchall()
-        print(f"[📊] Из таблицы config 1С получено {len(records)} системных структурных манифестов.")
-        
-        objects_discovered = 0
-        uuid_pattern = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
-        
-        # Карта классов метаданных для человекочитаемого вывода в PyQt6 GUI
-        metadata_map = {
-            "Catalogs": "Справочник",
-            "Documents": "Документ",
-            "Reports": "Отчет",
-            "DataProcessors": "Обработка",
-            "InformationRegisters": "РегистрСведений",
-            "AccumulationRegisters": "РегистрНакопления",
-            "CommonModules": "ОбщийМодуль",
-            "ChartsOfCharacteristicTypes": "ПланВидовХарактеристик"
-        }
-        
-        for filename, binarydata in records:
-            if not binarydata:
-                continue
-                
-            try:
-                # Декомпрессия raw deflate (wbits=-zlib.MAX_WBITS)
-                raw_data = zlib.decompress(bytes(binarydata), -zlib.MAX_WBITS)
-                text_content = raw_data.decode('utf-8-sig', errors='ignore')
-                
-                # Ищем все UUID объектов метаданных внутри манифеста
-                found_uuids = uuid_pattern.findall(text_content)
-                
-                for obj_uuid in set(found_uuids):
-                    obj_uuid_lower = obj_uuid.lower()
-                    
-                    # Смотрим контекст вокруг UUID, чтобы вытащить имя объекта
-                    pos = text_content.find(obj_uuid)
-                    context = text_content[max(0, pos-150):min(len(text_content), pos+200)]
-                    
-                    # Извлекаем строковые имена объектов 1С в кавычках (например, "Номенклатура")
-                    names = re.findall(r'"([A-Za-zА-Яа-я0-9_]+)"', context)
-                    if not names:
-                        continue
-                        
-                    object_name = names[0]
-                    
-                    # Фильтруем технический мусор платформы
-                    if object_name in ['Metadata', 'Root', 'Version', 'DataHistory', 'Container']:
-                        continue
-                    
-                    # Пытаемся определить класс метаданных по английскому маркеру в контексте
-                    object_type = "ОбъектМетаданных"
-                    for eng_key, rus_name in metadata_map.items():
-                        if eng_key.lower() in context.lower():
-                            object_type = rus_name
-                            break
-                    
-                    # Для каждого UUID регистрируем точки привязки под модули (.0 и .m)
-                    for ext in ['.0', '.m']:
-                        virtual_filename = f"{obj_uuid_lower}{ext}"
-                        ai_id = str(uuid.uuid4())
-                        
-                        query_ai = """
-                            INSERT INTO ai_metadata_objects (id, filename, object_name, object_type, logical_uuid, is_active)
-                            VALUES (%s, %s, %s, %s, %s, TRUE)
-                            ON CONFLICT (filename) DO UPDATE 
-                            SET object_name = EXCLUDED.object_name,
-                                object_type = EXCLUDED.object_type,
-                                logical_uuid = EXCLUDED.logical_uuid;
-                        """
-                        cursor_ai.execute(query_ai, (ai_id, virtual_filename, object_name, object_type, obj_uuid_lower))
-                        objects_discovered += 1
-                        
-            except zlib.error:
-                continue  # Если файл не сжат алгоритмом deflate, идем дальше
-            except Exception:
-                continue
-                
-        conn_ai.commit()
-        print(f"[✅] Синхронизация структуры завершена. В базу 1C_AI_Database записано {objects_discovered} объектов метаданных.")
-        
-     except Exception as e:
-        print(f"[💥] Критический сбой при парсинге метаданных: {e}")
-        conn_1c.rollback()
-        conn_ai.rollback()
-     finally:
-        cursor_1c.close()
-        cursor_ai.close()
-        conn_1c.close()
-        conn_ai.close()
-
 def extract_and_cache_source_codes(self):
     """
     Шаг 2: Прямое извлечение BSL-кода (.0 и .m) из таблицы config 1С,
@@ -295,12 +169,12 @@ def extract_and_cache_source_codes(self):
         conn_1c.rollback()
         conn_ai.rollback()
     finally:
-        cursor_1c.close()
-        cursor_ai.close()
-        conn_1c.close()
-        conn_ai.close()
+       cursor_1c.close()
+       cursor_ai.close()
+       conn_1c.close()
+       conn_ai.close()
 
-     print(f"🏁 Шаг 2 завершен! В СУБД ИИ успешно кэшировано {modules_found} чистых BSL-модулей.")
+    print(f"🏁 Шаг 2 завершен! В СУБД ИИ успешно кэшировано {modules_found} чистых BSL-модулей.")
 
     # ====================================================================
     # ШАГ 3: ИЗВЛЕЧЕНИЕ РЕКВИЗИТОВ С ГЕНЕРАЦИЕЙ UUID В PYTHON
@@ -407,11 +281,138 @@ def run_full_sync():
         manager.close()
 
 
-if __name__ == "__main__":
-    print("[🚀] Инициализация процесса изнутри dbserver.py...")
-    # Создаем экземпляр вашего класса. 
-    # Внимание: если ваш класс называется по-другому (например, DatabaseServer или ConfigDB),
-    # замените имя "DBServer()" на реальное имя класса из начала вашего файла.
-    db = DBServerManager() 
+    def sync_metadata_structure(self):
+        """
+        Шаг 1: Извлечение структуры метаданных из 1С в базу 1C_AI_Database.
+        Парсит файлы 'root' и 'metadata' из config без чтения тяжелых таблиц данных.
+        """
+        print("[🔄] Шаг 1: Запуск парсинга структуры метаданных конфигурации 1С...")
+        
+        # 1. Открываем два раздельных соединения через вашу базовую функцию
+        try:
+            conn_1c = self._connect_db()  # Подключение к рабочей СУБД 1С
+            conn_ai = self._connect_db()  # Подключение к вашей 1C_AI_Database
+        except Exception as e:
+            print(f"[❌] Ошибка инициализации подключений к СУБД: {e}")
+            return
+
+        cursor_1c = conn_1c.cursor()
+        cursor_ai = conn_ai.cursor()
+        
+        # 2. Инициализируем целевую таблицу ai_metadata_objects в базе ИИ, если её нет
+        cursor_ai.execute("""
+            CREATE TABLE IF NOT EXISTS ai_metadata_objects (
+                id UUID PRIMARY KEY,
+                filename VARCHAR(255) UNIQUE,
+                object_name VARCHAR(255),
+                object_type VARCHAR(100),
+                logical_uuid VARCHAR(50),
+                source_code TEXT,
+                is_active BOOLEAN DEFAULT TRUE
+            );
+        """)
+        conn_ai.commit()
+        
+        # 3. Выбираем манифесты из таблицы config базы 1С
+        query_1c = "SELECT filename, binarydata FROM config WHERE filename IN ('root', 'metadata') OR filename LIKE '__________-____-____-____-____________';"
+        
+        try:
+            cursor_1c.execute(query_1c)
+            records = cursor_1c.fetchall()
+            print(f"[📊] Из таблицы config 1С получено {len(records)} системных структурных манифестов.")
+            
+            objects_discovered = 0
+            
+            # Шаблон для поиска UUID конфигурации
+            import re, zlib, uuid
+            uuid_pattern = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+            
+            # Англо-русская карта метаданных для красивого дерева в PyQt6 GUI
+            metadata_map = {
+                "Catalogs": "Справочник",
+                "Documents": "Документ",
+                "Reports": "Отчет",
+                "DataProcessors": "Обработка",
+                "InformationRegisters": "РегистрСведений",
+                "AccumulationRegisters": "РегистрНакопления",
+                "CommonModules": "ОбщийМодуль",
+                "ChartsOfCharacteristicTypes": "ПланВидовХарактеристик",
+                "BusinessProcesses": "БизнесПроцесс"
+            }
+            
+            for filename, binarydata in records:
+                if not binarydata:
+                    continue
+                    
+                try:
+                    # Распаковываем raw deflate (wbits=-zlib.MAX_WBITS)
+                    raw_data = zlib.decompress(bytes(binarydata), -zlib.MAX_WBITS)
+                    text_content = raw_data.decode('utf-8-sig', errors='ignore')
+                    
+                    found_uuids = uuid_pattern.findall(text_content)
+                    
+                    for obj_uuid in set(found_uuids):
+                        obj_uuid_lower = obj_uuid.lower()
+                        
+                        pos = text_content.find(obj_uuid)
+                        context = text_content[max(0, pos-150):min(len(text_content), pos+200)]
+                        
+                        # Извлекаем строковые русские/английские имена объектов 1С в кавычках
+                        names = re.findall(r'"([A-Za-zА-Яа-я0-9_]+)"', context)
+                        if not names:
+                            continue
+                            
+                        object_name = names[0]
+                        
+                        # Фильтруем системный мусор платформы 1С
+                        if object_name in ['Metadata', 'Root', 'Version', 'DataHistory', 'Container']:
+                            continue
+                        
+                        # Определяем класс метаданных по английскому префиксу в контексте
+                        object_type = "ОбъектМетаданных"
+                        for eng_key, rus_name in metadata_map.items():
+                            if eng_key.lower() in context.lower():
+                                object_type = rus_name
+                                break
+                        
+                        # Регистрируем виртуальные файлы модулей (.0 и .m)
+                        for ext in ['.0', '.m']:
+                            virtual_filename = f"{obj_uuid_lower}{ext}"
+                            ai_id = str(uuid.uuid4())
+                            
+                            query_ai = """
+                                INSERT INTO ai_metadata_objects (id, filename, object_name, object_type, logical_uuid, is_active)
+                                VALUES (%s, %s, %s, %s, %s, TRUE)
+                                ON CONFLICT (filename) DO UPDATE 
+                                SET object_name = EXCLUDED.object_name,
+                                    object_type = EXCLUDED.object_type,
+                                    logical_uuid = EXCLUDED.logical_uuid;
+                            """
+                            cursor_ai.execute(query_ai, (ai_id, virtual_filename, object_name, object_type, obj_uuid_lower))
+                            objects_discovered += 1
+                            
+                except zlib.error:
+                    continue
+                except Exception:
+                    continue
+                    
+            conn_ai.commit()
+            print(f"[✅] Синхронизация структуры завершена. В базу записано {objects_discovered} объектов метаданных.")
+            
+        except Exception as e:
+            print(f"[💥] Критический сбой при парсинге метаданных: {e}")
+            conn_1c.rollback()
+            conn_ai.rollback()
+        finally:
+            cursor_1c.close()
+            cursor_ai.close()
+            conn_1c.close()
+            conn_ai.close()
+            
+    if __name__ == "__main__":
+     print("[🚀] Инициализация процесса изнутри dbserver.py...")
+    # Создаем экземпляр правильного класса DBServerManager
+    db = DBServerManager()  
+       # Запускаем синхронизацию структуры
     db.sync_metadata_structure()
-    run_full_sync()
+    
