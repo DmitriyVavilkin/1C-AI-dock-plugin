@@ -10,7 +10,7 @@
     "host": "172.16.30.204",
     "database": "1C_AI_Database",
     "user": "postgres",
-    "password": "Viseo193DX",
+    "password": "",
     "port": 5432
   },
   
