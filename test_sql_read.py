@@ -1,12 +1,12 @@
 # test_sql_read.py
-from dbserver import DBServer # Или как называется ваш основной класс управления СУБД
+from dbserver import DBServer
 
 def main():
+    print("[🚀] Инициализация DBServer для выгрузки структуры...")
     db = DBServer()
-    # Запускаем наш автономный метод Шага 2
-    db.extract_and_cache_source_codes()
+    
+    # Запускаем прямую синхронизацию метаданных
+    db.sync_metadata_structure()
 
 if __name__ == "__main__":
     main()
-# 
-# 
