@@ -1,135 +1,105 @@
-import psycopg2
-import uuid
-import json
 import os
-import re
+import psycopg2
+from dbserver import DB_PARAMS, decompose_1c_path, clean_and_split_stream
 
-def load_ai_config():
-    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-    if os.path.exists(config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f).get("db_ai", {})
-    return {"host": "localhost", "port": 5432, "user": "postgres", "password": "", "dbname": "1C_AI_Database"}
+def scan_and_build_tree(root_directory_path):
+    """
+    Сканирует локальный каталог с исходниками 1С, парсит их 
+    и загружает в БД в соответствии с новой иерархической структурой.
+    """
+    if not os.path.exists(root_directory_path):
+        print(f"[Ошибка] Указанный путь не существует: {root_directory_path}")
+        return
 
-def main():
-    print("[🚀] Запуск прецизионного контекстного анализа кодов для дерева 1С...")
-    cai = load_ai_config()
+    print(f"[Сканирование] Старт анализа директории: {root_directory_path}")
     
-    conn_ai = psycopg2.connect(**cai)
-    cursor_ai = conn_ai.cursor()
+    # Подключаемся к базе для пакетной обработки
+    conn = psycopg2.connect(**DB_PARAMS)
+    cursor = conn.cursor()
     
-    try:
-        # Каскадно очищаем старую нечитаемую структуру
-        cursor_ai.execute("TRUNCATE TABLE ai_metadata_objects CASCADE;")
-        conn_ai.commit()
-        
-        # Читаем все успешно загруженные модули
-        print("[🔍] Извлечение текстов BSL-модулей из базы ИИ...")
-        cursor_ai.execute("SELECT code_filename, source_code FROM ai_metadata_source_codes WHERE source_code IS NOT NULL;")
-        rows = cursor_ai.fetchall()
-        print(f"[📊] Доступно {len(rows)} модулей для контекстного анализа.")
-        
-        mapped_count = 0
-        
-        for code_filename, source_code in rows:
-            filename_lower = code_filename.lower()
-            # 🔥 ИСПРАВЛЕНО: Безопасно отрезаем последние 2 символа (".0" или ".m"), 
-            # чтобы получить чистый логический UUID без всяких split()
-            logical_uuid = filename_lower[:-2]
-            
-            # Дефолтные значения на случай, если маркеры не найдутся
-            # object_type = "Общие модули"
-            
-            # 🔥 ИСПРАВЛЕНО: Сначала берем UUID по индексу 0, а потом приводим к нижнему регистру
-            #logical_uuid = filename_lower.split('')[0].lower()
+    processed_count = 0
+    skipped_count = 0
+    
+    # Шаблон SQL-запроса для пакетного UPSERT
+    upsert_query = """
+        INSERT INTO ai_metadata_source_codes 
+        (object_type, object_name, sub_type, sub_name, module_type, bsl_code, v8_structure, raw_path)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (raw_path) 
+        DO UPDATE SET 
+            bsl_code = EXCLUDED.bsl_code,
+            v8_structure = EXCLUDED.v8_structure,
+            updated_at = CURRENT_TIMESTAMP;
+    """
+
+    # Рекурсивный обход папок проекта
+    for root, dirs, files in os.walk(root_directory_path):
+        for file in files:
+            # Нас интересуют как чистые bsl, так и текстовые структуры метаданных
+            if file.endswith('.bsl') or file.endswith('.txt') or file.lower() == 'text':
+                full_path = os.path.join(root, file)
+                
+                # Создаем относительный или виртуальный путь для 1С-координат
+                # Например: Документ.РеализацияТоваровУслуг.МодульОбъекта
+                relative_path = os.path.relpath(full_path, root_directory_path)
+                
+                try:
+                    with open(full_path, 'rb') as f:
+                        raw_binary = f.read()
                         
-            # Дефолтные значения на случай, если маркеры не найдутся
-            object_type = "Общие модули"
-            synonym = f"Модуль_{logical_uuid[:8]}"
-            
-            # Берем первые 20 строк кода для поиска метаданных
-            header_lines = "\n".join(source_code.split("\n")[:20])
-            
-            # 🔥 АЛГОРИТМ 1: Ищем директивы расширений конфигурации (самый точный маппинг)
-            # &Вместо("Документ.ЗаказКлиента.МодульОбъекта") или &ИзменениеОригинальногоМетода
-            ext_match = re.search(r'(?:Вместо|Перед|После)\s*\(\s*"([^"]+)"', header_lines, re.IGNORECASE)
-            
-            # 🔥 АЛГОРИТМ 2: Ищем штатные комментарии платформы или разработчиков
-            # // Документ.ПередачаТоваровХранителю или // Справочник.Номенклатура.МодульМенеджера
-            comment_match = re.search(r'//\s*(Документ|Справочник|Отчет|Обработка|РегистрСведений)\.([A-Za-zА-Яа-я0-9_]+)', header_lines, re.IGNORECASE)
-            
-            if ext_match:
-                # Найдена директива расширения: "Документ.ЗаказКлиента.МодульОбъекта"
-                meta_path = ext_match.group(1).split('.')
-                if len(meta_path) >= 2:
-                    class_name = meta_path
-                    synonym = meta_path[1]
+                    # Очищаем бинарный поток от 0x00, 7fffffff и делим на код/структуру
+                    bsl_code, v8_structure = clean_and_split_stream(raw_binary)
                     
-                    if "document" in class_name.lower(): object_type = "Документы"
-                    elif "catalog" in class_name.lower(): object_type = "Справочники"
-                    elif "report" in class_name.lower(): object_type = "Отчеты"
-                    elif "processor" in class_name.lower(): object_type = "Обработки"
-            
-            elif comment_match:
-                # Найден комментарий структуры
-                rus_class = comment_match.group(1).lower()
-                synonym = comment_match.group(2)
-                
-                if "документ" in rus_class: object_type = "Документы"
-                elif "справочник" in rus_class: object_type = "Справочники"
-                elif "отчет" in rus_class: object_type = "Отчеты"
-                elif "обработка" in rus_class: object_type = "Обработки"
-                elif "регистр" in rus_class: object_type = "Регистры"
-            
-            else:
-                # 🔥 АЛГОРИТМ 3: Если это Общий модуль, ищем ключевые маркеры бизнес-логики или имя первой экспортной функции
-                if filename_lower.endswith('.m'):
-                    object_type = "Общие модули"
-                    # Пытаемся вытащить имя функции как имя модуля менеджера
-                    biz_fn = re.search(r'(?:Процедура|Функция)\s+([A-Za-zА-Яа-я0-9_]+)', header_lines)
-                    if biz_fn:
-                        synonym = biz_fn.group(1)
-                        if "документ" in header_lines.lower() or "проведение" in header_lines.lower():
-                            object_type = "Документы"
-                else:
-                    # Если это макет регламентированного отчета (наш прошлый случай)
-                    if "ФЕДЕРАЛЬНОЕ СТАТИСТИЧЕСКОЕ НАБЛЮДЕНИЕ" in source_code or '{"ru","' in source_code:
-                        object_type = "Отчеты (Макеты)"
-                        ru_names = re.findall(r'{"ru",\s*"([^"]+)"}', source_code[:2000])
-                        if ru_names:
-                            synonym = max(ru_names, key=len)
-                        else:
-                            synonym = f"Форма_Росстата_{logical_uuid[:4]}"
-            
-            # Формируем окончательный синоним для дерева
-            if filename_lower.endswith('.m') and object_type in ["Документы", "Справочники"]:
-                synonym = f"{synonym} (Менеджер)"
-            elif filename_lower.endswith('.0') and object_type in ["Документы", "Справочники"]:
-                synonym = f"{synonym} (Объект)"
-                
-            # Записываем эталонную запись строго по схеме вашей таблицы СУБД из pgAdmin:
-            query_insert = """
-                INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, synonym, sql_table_name)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (internal_name) 
-                DO UPDATE SET synonym = EXCLUDED.synonym, object_type = EXCLUDED.object_type;
-            """
-            cursor_ai.execute(query_insert, (logical_uuid, object_type, filename_lower, synonym, "ERP_CONTEXT_MAPPED"))
-            mapped_count += 1
-            
-            if mapped_count % 5000 == 0:
-                conn_ai.commit()
-                print(f"[🔹] Обработано {mapped_count} модулей...")
-                
-        conn_ai.commit()
-        print(f"[✅] Контекстный анализ завершен! В структуру Конфигуратора успешно заведено {mapped_count} объектов.")
-        
-    except Exception as e:
-        print(f"[💥] Ошибка генерации дерева: {e}")
-        conn_ai.rollback()
-    finally:
-        cursor_ai.close()
-        conn_ai.close()
+                    # Интеллектуальный контекстный анализ: ищем маркеры расширений 1С
+                    if "&Вместо" in bsl_code:
+                        # Если это расширение, мы можем пометить тип или имя объекта для ИИ
+                        pass # При необходимости сюда добавляется логика тегирования аспектного кода
+                        
+                    # Парсим канонические координаты Конфигуратора 1С
+                    path_info = decompose_1c_path(relative_path)
+                    
+                    # Если полезного кода нет, пишем аккуратный комментарий-заглушку
+                    if not bsl_code.strip():
+                        bsl_code = f"// Модуль '{relative_path}' не содержит исполняемого кода BSL."
+                        
+                    # Выполняем запись в базу
+                    cursor.execute(upsert_query, (
+                        path_info["object_type"],
+                        path_info["object_name"],
+                        path_info["sub_type"],
+                        path_info["sub_name"],
+                        path_info["module_type"],
+                        bsl_code,
+                        v8_structure,
+                        relative_path
+                    ))
+                    
+                    processed_count += 1
+                    
+                    # Коммитим пачками по 500 элементов, чтобы не перегружать память
+                    if processed_count % 500 == 0:
+                        conn.commit()
+                        print(f"[Успех] Обработано файлов: {processed_count}...")
+                        
+                except Exception as e:
+                    print(f"[Пропущено] Ошибка обработки файла {relative_path}: {e}")
+                    skipped_count += 1
+
+    # Финальный коммит оставшихся данных
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    print("\n[Результаты раунда контекстного анализа]:")
+    print(f"🚀 Успешно разложено по папкам и загружено: {processed_count} файлов.")
+    print(f"⚠️ Пропущено из-за ошибок чтения: {skipped_count} файлов.")
 
 if __name__ == "__main__":
-    main()
+    # Укажите путь к вашей локальной папке, куда выгружен прототип/конфигурация ERP
+    TARGET_DIR = "./ext_source_1c" 
+    
+    # Запуск сканирования
+    if os.path.exists(TARGET_DIR):
+        scan_and_build_tree(TARGET_DIR)
+    else:
+        print(f"[Внимание] Перед запуском обновите TARGET_DIR в скрипте или создайте папку '{TARGET_DIR}'")
