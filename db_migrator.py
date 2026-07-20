@@ -52,7 +52,6 @@ class DbMigratorEngine:
         try:
             conn = psycopg2.connect(**self.config_1c)
             with conn.cursor() as cursor:
-                # Извлекаем системные таблицы метаданных
                 cursor.execute("SELECT filename, binarydata FROM config WHERE filename IN ('root', 'version');")
                 for filename, binarydata in cursor.fetchall():
                     text_content = self._decompress_v8_zlib(bytes(binarydata))
@@ -60,7 +59,6 @@ class DbMigratorEngine:
                         raw_uuid = match.group(1).lower()
                         file_hash = match.group(2).lower()
                         
-                        # Форматируем UUID в стандарт PostgreSQL
                         if '-' not in raw_uuid and len(raw_uuid) == 32:
                             uuid_str = f"{raw_uuid[:8]}-{raw_uuid[8:12]}-{raw_uuid[12:16]}-{raw_uuid[16:20]}-{raw_uuid[20:]}"
                         else:
@@ -75,14 +73,13 @@ class DbMigratorEngine:
         return hash_to_uuid
 
     def execute_migration(self):
-        """Шаг 2: Массовая реконсиляция, создание таблиц и жесткая увязка метаданных"""
+        """Шаг 2: Массовая реконсиляция, создание таблиц и жесткая увязка метаданных по UUID"""
         print(f"[INFO] Подключение к ИИ-хранилищу {self.config_ai.get('dbname')}...")
         conn_ai = None
         try:
             conn_ai = psycopg2.connect(**self.config_ai)
             with conn_ai.cursor() as cursor:
                 # 1. Инициализируем структуру таблиц
-                               # 1. Инициализируем структуру таблиц и временно снимаем ограничение NOT NULL
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS ai_metadata_objects (
                         object_id UUID PRIMARY KEY,
@@ -93,96 +90,79 @@ class DbMigratorEngine:
                     );
                     ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS resolved_object_id UUID;
                     ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS module_type VARCHAR(50);
-                    
-                    -- Снимаем ограничение NOT NULL, чтобы разрешить временный сброс кэша
                     ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type DROP NOT NULL;
                 """)
                 
-                # Принудительно сбрасываем старые связи для полной чистой переиндексации
                 print("[INFO] Сброс старого кэша связей в базе ИИ...")
                 cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
 
-                print("[INFO] Запуск интеллектуального текстового сопоставления структуры...")
-                
-                # UPDATE Шаг 1: Привязка Справочников, Документов и Отчетов по Синонимам и Внутренним именам
+                # 2. Создаем скоростные индексы для связи UUID
+                print("[INFO] Создание скоростных функциональных индексов СУБД...")
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_fast_obj_uuid ON ai_metadata_objects (object_id);
+                    CREATE INDEX IF NOT EXISTS idx_fast_src_clean_uuid ON ai_metadata_source_codes (
+                        LOWER(TRIM(split_part(raw_path, '.', 1)))
+                    );
+                """)
+
+                print("[INFO] Запуск точной пакетной увязки ERP по бинарным UUID...")
+                # Явное приведение типов через ::uuid добавлено в строку SET resolved_object_id
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes src
                     SET resolved_object_id = obj.object_id::uuid,
-                        module_type = CASE WHEN src.object_name LIKE '%.1' THEN 'МодульМенеджера' ELSE 'МодульОбъекта' END
+                        module_type = CASE 
+                            WHEN obj.object_type = 'CommonModule' THEN 'ОбщийМодуль'
+                            WHEN src.object_name ILIKE '%Менеджер%' OR src.object_name ILIKE '%.1' THEN 'МодульМенеджера'
+                            ELSE 'МодульОбъекта'
+                        END
                     FROM ai_metadata_objects obj
-                    WHERE LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name))
-                       OR LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name));
+                    WHERE obj.object_id::text = LOWER(TRIM(split_part(src.raw_path, '.', 1)))
+                      AND obj.object_id::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
                 """)
                 step1 = cursor.rowcount
-                
-                # UPDATE Шаг 2: Точечная привязка Общих модулей
+                print(f"[SUCCESS] Прямым сопоставлением UUID успешно увязано модулей: {step1}")
+
+                # 3. Интеллектуальный мягкий добор для расширений и форм по именам/синонимам
+                print("[INFO] Мягкий добор оставшихся кастомных объектов и расширений...")
+                # Сюда также добавлено явное приведение типов ::uuid
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes src
                     SET resolved_object_id = obj.object_id::uuid,
-                        module_type = 'ОбщийМодуль'
+                        module_type = CASE 
+                            WHEN obj.object_type = 'CommonModule' THEN 'ОбщийМодуль'
+                            ELSE 'МодульОбъекта'
+                        END
                     FROM ai_metadata_objects obj
-                    WHERE obj.object_type = 'CommonModule'
-                      AND (LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name))
-                           OR LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name)))
-                      AND src.resolved_object_id IS NULL;
+                    WHERE src.resolved_object_id IS NULL
+                      AND obj.object_id::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                      AND (
+                        LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.internal_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                        OR LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                      );
                 """)
                 step2 = cursor.rowcount
-                
-                # Для системных файлов, которые не привязались, ставим дефолтное значение типа,
-                # чтобы вернуть обратно строгое ограничение NOT NULL в СУБД
+                print(f"[SUCCESS] Дополнительно привязано объектов расширений: {step2}")
+
+                # 4. Изолируем служебные файлы платформы
+                print("[INFO] Закрытие контура служебных файлов платформы...")
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes 
                     SET module_type = 'СистемныйМодуль' 
-                    WHERE module_type IS NULL;
+                    WHERE resolved_object_id IS NULL;
                     
-                    -- Возвращаем ограничение целостности базы данных обратно
                     ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type SET NOT NULL;
                 """)
                 
-                # Принудительно сбрасываем старые связи для полной чистой переиндексации
-                print("[INFO] Сброс старого кэша связей в базе ИИ...")
-                cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
-
-                print("[INFO] Запуск интеллектуального текстового сопоставления структуры...")
-                
-                # UPDATE Шаг 1: Привязка Справочников, Документов и Отчетов по Синонимам и Внутренним именам
-                cursor.execute("""
-                    UPDATE ai_metadata_source_codes src
-                    SET resolved_object_id = obj.object_id::uuid,
-                        module_type = CASE WHEN src.object_name LIKE '%.1' THEN 'МодульМенеджера' ELSE 'МодульОбъекта' END
-                    FROM ai_metadata_objects obj
-                    WHERE LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name))
-                       OR LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name));
-                """)
-                step1 = cursor.rowcount
-                
-                # UPDATE Шаг 2: Точечная привязка Общих модулей. 1С часто пишет их как CommonModule или ОбщийМодуль в object_type.
-                # Сравниваем имя файла (например, ОбщегоНазначения) с internal_name объекта метаданных
-                cursor.execute("""
-                    UPDATE ai_metadata_source_codes src
-                    SET resolved_object_id = obj.object_id::uuid,
-                        module_type = 'ОбщийМодуль'
-                    FROM ai_metadata_objects obj
-                    WHERE obj.object_type = 'CommonModule'
-                      AND (LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name))
-                           OR LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name)))
-                      AND src.resolved_object_id IS NULL;
-                """)
-                step2 = cursor.rowcount
-                
-                total = step1 + step2
-                print(f"[SUCCESS] База успешно реструктурирована! Связано модулей: {total}")
-                print(f"-> Объектов (Справочники/Документы/Отчеты) привязано: {step1}")
-                print(f"-> Общих модулей привязано по именам: {step2}")
-                
                 conn_ai.commit()
+                print(f"[SUCCESS] Миграция ERP завершена! Всего связано: {step1 + step2} модулей.")
+                
         except Exception as e:
             print(f"[ERROR] Критический сбой миграции БД: {e}")
             if conn_ai: conn_ai.rollback()
         finally:
             if conn_ai: conn_ai.close()
-   
-   
+
+
 
 if __name__ == "__main__":
     migrator = DbMigratorEngine()

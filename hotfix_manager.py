@@ -1,87 +1,95 @@
-import zlib
 import psycopg2
-import json
-import os
+import zlib
+from datetime import datetime
 
-class CHotFixManager:
-    def __init__(self, config_path="config.json"):
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Конфигурационный файл {config_path} не найден.")
-            
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-            
-        pg = config_data.get("postgres", {})
-        # ВНИМАНИЕ: Для хотфикса нам нужны права на ЗАПИСЬ в контур 1С (mpk_new_vavilkin)
-        # Убедитесь, что у пользователя postgres есть туда доступ на запись.
-        self.db_config_1c = {
-            "host": pg.get("host", "172.16.30.204"),
-            "database": config_data.get("ibsrv", {}).get("base_name", "mpk_new_vavilkin"),
-            "user": pg.get("user", "postgres"),
-            "password": pg.get("password", ""),
-            "port": pg.get("port", 5432)
-        }
+class HotfixBackupManager:
+    def __init__(self, db_1c_config, db_ai_config):
+        """
+        db_1c_config: параметры СУБД боевой/тестовой базы 1С:ERP
+        db_ai_config: параметры СУБД вашего ИИ-хранилища (1C_AI_Database)
+        """
+        self.db_1c = db_1c_config
+        self.db_ai = db_ai_config
 
-    def _compress_to_1c_format(self, bsl_text):
+    def create_safe_backup(self, metadata_uuid: str, filename_key: str) -> bool:
         """
-        Упаковывает чистый текст BSL-кода обратно в бинарный формат v8-deflate (zlib raw).
-        1С требует кодировку UTF-8 с сигнатурой (BOM).
+        Шаг 1: Вычитывает сырой BLOB из боевой Config 1С и делает
+        слепок в таблицу бэкапов ИИ-хранилища перед внесением изменений.
         """
-        # Кодируем с BOM файлом (\xef\xbb\xbf)
-        bom_utf8_data = bsl_text.encode('utf-8-sig')
-        # Сжимаем без zlib-заголовков (wbits=-15 задает raw deflate)
-        return zlib.compress(bom_utf8_data, level=9, wbits=-15)
-
-    def apply_hotfix(self, object_id, new_bsl_text):
-        """
-        Записывает исправленный код модуля напрямую в рабочую СУБД 1С.
-        """
-        print(f"📦 Подготовка бинарного контейнера для объекта {object_id}...")
-        binary_blob = self._compress_to_1c_format(new_bsl_text)
-        
-        conn = None
         try:
-            conn = psycopg2.connect(**self.db_config_1c)
-            with conn.cursor() as cur:
-                # 1. Делаем бэкап старого модуля в лог или временный файл на случай отката!
-                cur.execute("SELECT binarydata FROM config WHERE filename = %s;", (object_id,))
-                backup_row = cur.fetchone()
-                if backup_row:
-                    self._save_backup(object_id, backup_row[0])
+            # 1. Читаем оригинальный бинарник из базы 1С
+            conn_1c = psycopg2.connect(**self.db_1c)
+            with conn_1c.cursor() as cursor_1c:
+                cursor_1c.execute(
+                    "SELECT binarydata FROM config WHERE filename = %s;", 
+                    (filename_key,)
+                )
+                row = cursor_1c.fetchone()
+                if not row or not row[0]:
+                    conn_1c.close()
+                    raise Exception(f"Запись {filename_key} не найдена в таблице Config СУБД 1С.")
+                original_blob = row[0]
+            conn_1c.close()
 
-                # 2. Обновляем тело модуля в живой базе 1С
-                print(f"🚀 Запись патча в таблицу config базы {self.db_config_1c['database']}...")
-                cur.execute("""
-                    UPDATE config 
-                    SET binarydata = %s 
-                    WHERE filename = %s;
-                """, (psycopg2.Binary(binary_blob), object_id))
-                
-                # 3. Инвалидация кэша сервера 1С (Партизанский метод)
-                # Обновляем системную строку конфигурации, заставляя rphost перечитать config
-                cur.execute("""
-                    UPDATE config 
-                    SET binarydata = binarydata 
-                    WHERE filename = 'version';
-                """)
-                
-                conn.commit()
-                print("🎯 Хотфикс успешно применен! Кэш сервера 1С спровоцирован на обновление.")
-                return True
-                
+            # 2. Пытаемся распаковать текст для сохранения текстовой копии (для аналитики)
+            try:
+                # 1С часто сжимает без заголовков zlib (Raw Deflate, wbits=-15)
+                backup_text = zlib.decompress(bytes(original_blob), -15).decode('utf-8', errors='ignore')
+            except Exception:
+                backup_text = "// [Бинарные данные: не удалось распаковать как сырой текст BSL]"
+
+            # 3. Сохраняем слепок в ИИ-хранилище
+            conn_ai = psycopg2.connect(**self.db_ai)
+            with conn_ai.cursor() as cursor_ai:
+                query_ai = """
+                    INSERT INTO ai_hotfix_backups (metadata_uuid, filename_key, original_binary, backup_text)
+                    VALUES (%s, %s, %s, %s);
+                """
+                cursor_ai.execute(query_ai, (metadata_uuid, filename_key, psycopg2.Binary(original_blob), backup_text))
+            conn_ai.commit()
+            conn_ai.close()
+            return True
+            
         except Exception as e:
-            if conn:
-                conn.rollback()
-            print(f"❌ Критическая ошибка при живой записи в СУБД 1С: {e}")
+            print(f"[BACKUP ERROR] Сбой создания точки восстановления: {e}")
             return False
-        finally:
-            if conn:
-                conn.close()
 
-    def _save_backup(self, object_id, original_binary):
-        """Сохраняет исходный модуль на диск перед перезаписью для мгновенного отката"""
-        os.makedirs("hotfix_backups", exist_ok=True)
-        backup_path = f"hotfix_backups/{object_id}.bak"
-        with open(backup_path, "wb") as f:
-            f.write(original_binary)
-        print(f"💾 Оригинальный модуль сохранен в {backup_path} (Резервная копия для отката).")
+    def rollback_last_hotfix(self, metadata_uuid: str, filename_key: str) -> tuple[bool, str]:
+        """
+        Шаг 2: Механизм отката. Берет последний сохраненный бэкап 
+        из ИИ-базы и принудительно возвращает его на место в Config 1С.
+        """
+        try:
+            # 1. Извлекаем последний бэкап из ИИ-хранилища
+            conn_ai = psycopg2.connect(**self.db_ai)
+            with conn_ai.cursor() as cursor_ai:
+                query_ai = """
+                    SELECT original_binary FROM ai_hotfix_backups 
+                    WHERE metadata_uuid = %s AND filename_key = %s
+                    ORDER BY created_at DESC LIMIT 1;
+                """
+                cursor_ai.execute(query_ai, (metadata_uuid, filename_key))
+                row = cursor_ai.fetchone()
+                if not row:
+                    conn_ai.close()
+                    return False, "История бэкапов для данного объекта пуста."
+                backup_blob = row[0]
+            conn_ai.close()
+
+            # 2. Возвращаем оригинальный BLOB обратно в СУБД 1С
+            conn_1c = psycopg2.connect(**self.db_1c)
+            with conn_1c.cursor() as cursor_1c:
+                cursor_1c.execute(
+                    "UPDATE config SET binarydata = %s WHERE filename = %s;",
+                    (psycopg2.Binary(backup_blob), filename_key)
+                )
+                
+                # Инициируем сброс кэша конфигурации rphost
+                cursor_1c.execute("UPDATE config SET binarydata = binarydata WHERE filename = 'version';")
+            conn_1c.commit()
+            conn_1c.close()
+            
+            return True, "Успешный откат! Оригинальный модуль восстановлен в СУБД 1С."
+            
+        except Exception as e:
+            return False, f"Критическая ошибка восстановления из бэкапа: {str(e)}"
