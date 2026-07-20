@@ -1,198 +1,189 @@
-import sys
 import os
 import json
-import psycopg2
 import zlib
 import re
+import psycopg2
+from psycopg2.extras import execute_values
 
-def load_configs():
-    """Считывает параметры подключения к базам из config.json."""
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    if not os.path.exists(config_path):
-        print("[Ошибка] config.json не найден!")
-        sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("db_1c"), data.get("db_ai")
+class DbMigratorEngine:
+    def __init__(self, config_path="config.json"):
+        self.config_path = config_path
+        self.config_1c = {}
+        self.config_ai = {}
+        
+        # Регулярное выражение для извлечения UUID и хэшей файлов из манифестов 1С
+        self.v8_pattern = re.compile(
+            r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}).*?([\w_]{8,})',
+            re.IGNORECASE
+        )
+        self.load_configuration()
 
-def build_uuid_cache(cursor_ai):
-    """
-    Выгружает весь ваш справочник ai_metadata_objects в память Python.
-    Это позволит мгновенно сопоставлять 106 000 файлов без выполнения
-    миллиона медленных SQL-запросов к базе в процессе миграции.
-    """
-    print("[Кэш] Индексация справочника метаданных ai_metadata_objects...")
-    # Так как справочник лежит в этой же базе (или доступен), тянем его структуры
-    # object_id (UUID файла), object_type (Document/Catalog), internal_name (Имя)
-    cursor_ai.execute("SELECT object_id, object_type, internal_name, synonym FROM ai_metadata_objects;")
-    rows = cursor_ai.fetchall()
-    
-    # Англо-русский маппинг типов для каноничного GUI Конфигуратора
-    type_map = {
-        "catalog": "Справочники", "catalog.": "Справочники",
-        "document": "Документы", "document.": "Документы",
-        "enum": "Перечисления", "enum.": "Перечисления",
-        "report": "Отчеты", "report.": "Отчеты",
-        "dataprocessor": "Обработки", "dataprocessor.": "Обработки",
-        "commonmodule": "Общие.Общие модули", "commonmodule.": "Общие.Общие модули",
-        "informationregister": "РегистрыСведений", "informationregister.": "РегистрыСведений",
-        "accumulationregister": "РегистрыНакопления", "accumulationregister.": "РегистрыНакопления"
-    }
-    
-    uuid_cache = {}
-    for obj_id, obj_type, int_name, synonym in rows:
-        if not obj_id: continue
-        
-        clean_id = str(obj_id).strip().lower()
-        clean_type = str(obj_type).strip().lower()
-        
-        # Переводим тип на русский язык для дерева IDE
-        ru_type = type_map.get(clean_type, clean_type.capitalize())
-        
-        # Предпочитаем Синоним 1С, если его нет — внутреннее имя
-        display_name = synonym if (synonym and synonym.strip()) else int_name
-        
-        uuid_cache[clean_id] = {
-            "object_type": ru_type,
-            "object_name": display_name if display_name else "НеизвестныйОбъект"
-        }
-    
-    print(f"[Кэш] Успешно проиндексировано объектов: {len(uuid_cache)}")
-    return uuid_cache
-def extract_uuid_from_filename(filename):
-    """
-    Вытаскивает валидный 1С UUID (8-4-4-4-12) из имени конфигурационного файла.
-    Пример: '0002a72d-486a-403a-b739-e8840c4bf173.bsl' -> '0002a72d-486a-403a-b739-e8840c4bf173'
-    """
-    match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', filename.lower())
-    return match.group(1) if match else None
+    def load_configuration(self):
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Конфиг {self.config_path} не найден.")
+        with open(self.config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        self.config_1c = config_data.get("db_1c", {})
+        self.config_ai = config_data.get("db_ai", {})
 
-def clean_and_split_stream(raw_binary_data):
-    """Декомпрессирует zlib-поток, удаляет PostgreSQL NUL (0x00) и маркеры 7fffffff."""
-    try:
-        decompressed = zlib.decompress(raw_binary_data, -zlib.MAX_WBITS).decode('utf-8', errors='ignore')
-    except Exception:
+    def _decompress_v8_zlib(self, binary_data: bytes) -> str:
+        """Декомпрессия бинарных блоков 1С с перебором байтовых префиксов СУБД"""
+        if not binary_data:
+            return ""
+        # Список каноничных байтовых смещений платформы 1С Предприятие
+        for offset in [0, 2, 4, 8]:
+            try:
+                return zlib.decompress(binary_data[offset:], 15 + 32).decode('utf-8', errors='ignore')
+            except zlib.error:
+                try:
+                    return zlib.decompress(binary_data[offset:], -15).decode('utf-8', errors='ignore')
+                except zlib.error:
+                    continue
         try:
-            decompressed = zlib.decompress(raw_binary_data).decode('utf-8', errors='ignore')
+            return binary_data.replace(b'\x00', b'').decode('utf-8', errors='ignore')
         except Exception:
-            decompressed = raw_binary_data.decode('utf-8', errors='ignore')
-        
-    cleaned = decompressed.replace('\x00', '')
-    cleaned = re.sub(r'^[0-7]f{7,}.*\n', '', cleaned)
-    
-    bsl_marker = re.search(r'(#Область|&НаКлиенте|&НаСервере|Процедура|Функция|//)', cleaned, re.IGNORECASE)
-    if bsl_marker:
-        idx = bsl_marker.start()
-        return cleaned[idx:].strip(), cleaned[:idx].strip()
-    return "", cleaned.strip()
+            return ""
 
-def run_pipeline():
-    """Запускает сквозной конвейер миграции СУБД -> СУБД с умным маппингом по UUID."""
-    db_1c_params, db_ai_params = load_configs()
-    if not db_1c_params or not db_ai_params:
-        print("[Ошибка] В config.json отсутствуют блоки db_1c или db_ai!")
-        return
-
-    print(f"[Конвейер] Подключение к СУБД 1С: {db_1c_params.get('host')}...")
-    conn_1c = psycopg2.connect(**db_1c_params)
-    cursor_1c = conn_1c.cursor()
-
-    print(f"[Конвейер] Подключение к СУБД ИИ: {db_ai_params.get('host')}...")
-    conn_ai = psycopg2.connect(**db_ai_params)
-    cursor_ai = conn_ai.cursor()
-
-    # Сначала строим кэш метаданных по UUID в оперативной памяти
-    uuid_cache = build_uuid_cache(cursor_ai)
-
-    # Шаблон INSERT в новую иерархическую схему таблицы
-    upsert_query = """
-        INSERT INTO ai_metadata_source_codes 
-        (config_source, is_active, object_type, object_name, sub_type, sub_name, module_type, bsl_code, v8_structure, raw_path)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (raw_path) DO UPDATE SET 
-            bsl_code = EXCLUDED.bsl_code,
-            v8_structure = EXCLUDED.v8_structure,
-            updated_at = CURRENT_TIMESTAMP;
-    """
-
-    # Запрашиваем сырые бинарные потоки из таблицы config рабочей базы 1С
-    sql_fetch_1c = "SELECT filename, binarydata FROM config WHERE binarydata IS NOT NULL;"
-    print("[SQL Запрос] Чтение таблицы config...")
-    cursor_1c.execute(sql_fetch_1c)
-
-    processed_count = 0
-    skipped_count = 0
-
-    print("[Миграция] Старт потокового сопоставления и заполнения СУБД ИИ...")
-    
-    while True:
-        row = cursor_1c.fetchone()
-        if not row:
-            break
-            
-        filename_str, raw_binary = row
-        filename_str = str(filename_str).strip()
-        
-        # Пытаемся вытащить UUID объекта из имени файла
-        obj_uuid = extract_uuid_from_filename(filename_str)
-        
-        # По умолчанию размечаем как системные данные, если UUID не найден в справочнике
-        info = {
-            "config_source": "main", "is_active": True,
-            "object_type": "СистемныеФайлы", "object_name": "Платформа1С",
-            "sub_type": None, "sub_name": None, "module_type": "Модуль"
-        }
-        
-        # Если UUID успешно вытащен и есть в кэше ai_metadata_objects, подставляем красивые имена!
-        if obj_uuid and obj_uuid in uuid_cache:
-            info["object_type"] = uuid_cache[obj_uuid]["object_type"]
-            info["object_name"] = uuid_cache[obj_uuid]["object_name"]
-
-        # Анализируем суффиксы файлов для определения типа модуля рантайма 1С
-        low_file = filename_str.lower()
-        if "module" in low_file or "модуль" in low_file:
-            if "manager" in low_file or "менеджер" in low_file:
-                info["module_type"] = "МодульМенеджера"
-            elif "object" in low_file or "объект" in low_file:
-                info["module_type"] = "МодульОбъекта"
-            elif "form" in low_file or "форма" in low_file:
-                info["sub_type"] = "Формы"
-                info["sub_name"] = "Форма"
-                info["module_type"] = "МодульФормы"
-            else:
-                info["module_type"] = "ОбщийМодуль"
+    def build_reconciliation_map(self) -> dict:
+        """Шаг 1: Извлечение системной карты соответствий хэшей и реальных UUID"""
+        print("[INFO] Вычитка манифестов root/version из рабочей базы 1С...")
+        hash_to_uuid = {}
         
         try:
-            binary_bytes = raw_binary.tobytes() if hasattr(raw_binary, 'tobytes') else bytes(raw_binary)
-            bsl_code, v8_structure = clean_and_split_stream(binary_bytes)
+            conn = psycopg2.connect(**self.config_1c)
+            with conn.cursor() as cursor:
+                # Извлекаем системные таблицы метаданных
+                cursor.execute("SELECT filename, binarydata FROM config WHERE filename IN ('root', 'version');")
+                for filename, binarydata in cursor.fetchall():
+                    text_content = self._decompress_v8_zlib(bytes(binarydata))
+                    for match in self.v8_pattern.finditer(text_content):
+                        raw_uuid = match.group(1).lower()
+                        file_hash = match.group(2).lower()
+                        
+                        # Форматируем UUID в стандарт PostgreSQL
+                        if '-' not in raw_uuid and len(raw_uuid) == 32:
+                            uuid_str = f"{raw_uuid[:8]}-{raw_uuid[8:12]}-{raw_uuid[12:16]}-{raw_uuid[16:20]}-{raw_uuid[20:]}"
+                        else:
+                            uuid_str = raw_uuid
+                            
+                        hash_to_uuid[file_hash] = uuid_str
+            conn.close()
+            print(f"[SUCCESS] Извлечено {len(hash_to_uuid)} системных связей из манифестов.")
+        except Exception as e:
+            print(f"[ERROR] Не удалось прочитать root/version: {e}. Переходим к запасному контуру.")
             
-            # Пропускаем пустые системные файлы для экономии места
-            if not bsl_code.strip() and not v8_structure.strip():
-                continue
-                
-            if not bsl_code.strip():
-                bsl_code = f"// Элемент '{filename_str}' содержит только структуру платформы."
+        return hash_to_uuid
 
-            # Пишем идеально размеченные данные в базу ИИ
-            cursor_ai.execute(upsert_query, (
-                info["config_source"], info["is_active"], info["object_type"], info["object_name"],
-                info["sub_type"], info["sub_name"], info["module_type"], bsl_code, v8_structure, filename_str
-            ))
-            
-            processed_count += 1
-            if processed_count % 500 == 0:
+    def execute_migration(self):
+        """Шаг 2: Массовая реконсиляция, создание таблиц и жесткая увязка метаданных"""
+        print(f"[INFO] Подключение к ИИ-хранилищу {self.config_ai.get('dbname')}...")
+        conn_ai = None
+        try:
+            conn_ai = psycopg2.connect(**self.config_ai)
+            with conn_ai.cursor() as cursor:
+                # 1. Инициализируем структуру таблиц
+                               # 1. Инициализируем структуру таблиц и временно снимаем ограничение NOT NULL
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS ai_metadata_objects (
+                        object_id UUID PRIMARY KEY,
+                        object_type VARCHAR(50),
+                        internal_name VARCHAR(255),
+                        synonym VARCHAR(255),
+                        is_extension BOOLEAN DEFAULT FALSE
+                    );
+                    ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS resolved_object_id UUID;
+                    ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS module_type VARCHAR(50);
+                    
+                    -- Снимаем ограничение NOT NULL, чтобы разрешить временный сброс кэша
+                    ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type DROP NOT NULL;
+                """)
+                
+                # Принудительно сбрасываем старые связи для полной чистой переиндексации
+                print("[INFO] Сброс старого кэша связей в базе ИИ...")
+                cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
+
+                print("[INFO] Запуск интеллектуального текстового сопоставления структуры...")
+                
+                # UPDATE Шаг 1: Привязка Справочников, Документов и Отчетов по Синонимам и Внутренним именам
+                cursor.execute("""
+                    UPDATE ai_metadata_source_codes src
+                    SET resolved_object_id = obj.object_id::uuid,
+                        module_type = CASE WHEN src.object_name LIKE '%.1' THEN 'МодульМенеджера' ELSE 'МодульОбъекта' END
+                    FROM ai_metadata_objects obj
+                    WHERE LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name))
+                       OR LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name));
+                """)
+                step1 = cursor.rowcount
+                
+                # UPDATE Шаг 2: Точечная привязка Общих модулей
+                cursor.execute("""
+                    UPDATE ai_metadata_source_codes src
+                    SET resolved_object_id = obj.object_id::uuid,
+                        module_type = 'ОбщийМодуль'
+                    FROM ai_metadata_objects obj
+                    WHERE obj.object_type = 'CommonModule'
+                      AND (LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name))
+                           OR LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name)))
+                      AND src.resolved_object_id IS NULL;
+                """)
+                step2 = cursor.rowcount
+                
+                # Для системных файлов, которые не привязались, ставим дефолтное значение типа,
+                # чтобы вернуть обратно строгое ограничение NOT NULL в СУБД
+                cursor.execute("""
+                    UPDATE ai_metadata_source_codes 
+                    SET module_type = 'СистемныйМодуль' 
+                    WHERE module_type IS NULL;
+                    
+                    -- Возвращаем ограничение целостности базы данных обратно
+                    ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type SET NOT NULL;
+                """)
+                
+                # Принудительно сбрасываем старые связи для полной чистой переиндексации
+                print("[INFO] Сброс старого кэша связей в базе ИИ...")
+                cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
+
+                print("[INFO] Запуск интеллектуального текстового сопоставления структуры...")
+                
+                # UPDATE Шаг 1: Привязка Справочников, Документов и Отчетов по Синонимам и Внутренним именам
+                cursor.execute("""
+                    UPDATE ai_metadata_source_codes src
+                    SET resolved_object_id = obj.object_id::uuid,
+                        module_type = CASE WHEN src.object_name LIKE '%.1' THEN 'МодульМенеджера' ELSE 'МодульОбъекта' END
+                    FROM ai_metadata_objects obj
+                    WHERE LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name))
+                       OR LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name));
+                """)
+                step1 = cursor.rowcount
+                
+                # UPDATE Шаг 2: Точечная привязка Общих модулей. 1С часто пишет их как CommonModule или ОбщийМодуль в object_type.
+                # Сравниваем имя файла (например, ОбщегоНазначения) с internal_name объекта метаданных
+                cursor.execute("""
+                    UPDATE ai_metadata_source_codes src
+                    SET resolved_object_id = obj.object_id::uuid,
+                        module_type = 'ОбщийМодуль'
+                    FROM ai_metadata_objects obj
+                    WHERE obj.object_type = 'CommonModule'
+                      AND (LOWER(TRIM(obj.internal_name)) = LOWER(TRIM(src.object_name))
+                           OR LOWER(TRIM(obj.synonym)) = LOWER(TRIM(src.object_name)))
+                      AND src.resolved_object_id IS NULL;
+                """)
+                step2 = cursor.rowcount
+                
+                total = step1 + step2
+                print(f"[SUCCESS] База успешно реструктурирована! Связано модулей: {total}")
+                print(f"-> Объектов (Справочники/Документы/Отчеты) привязано: {step1}")
+                print(f"-> Общих модулей привязано по именам: {step2}")
+                
                 conn_ai.commit()
-                print(f"🚀 Идеально размещено в СУБД ИИ: {processed_count} объектов...")
-                
-        except Exception as file_error:
-            skipped_count += 1
-
-    conn_ai.commit()
-    cursor_1c.close(); conn_1c.close(); cursor_ai.close(); conn_ai.close()
-    
-    print("\n🏁 [Итоги раунда эталонной миграции]:")
-    print(f"✅ Успешно перенесено и переименовано по Синонимам: {processed_count} записей.")
-    print(f"⚠️ Пропущено технических пустышек: {skipped_count} файлов.")
+        except Exception as e:
+            print(f"[ERROR] Критический сбой миграции БД: {e}")
+            if conn_ai: conn_ai.rollback()
+        finally:
+            if conn_ai: conn_ai.close()
+   
+   
 
 if __name__ == "__main__":
-    run_pipeline()
+    migrator = DbMigratorEngine()
+    migrator.execute_migration()

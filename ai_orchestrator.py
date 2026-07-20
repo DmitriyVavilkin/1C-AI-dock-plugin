@@ -1,121 +1,111 @@
+import os
 import json
 import requests
-import psycopg2
 
-class AIOrchestrator:
-    def __init__(self, pg_config, llm_config):
-        """Инициализация оркестратора ИИ-запросов"""
-        self.pg_config = pg_config
-        self.llm_url = llm_config['url']  # Например, http://localhost:1234/v1
-        self.llm_model = llm_config['model']
+class LocalAiOrchestrator:
+    def __init__(self, config_path="config.json"):
+        self.config_path = config_path
+        self.api_url = ""
+        self.model_name = ""
+        self.timeout = 120
+        self.load_settings()
 
-    def _get_db_connection(self):
-        """Создает подключение к вашей базе ИИ"""
-        conn = psycopg2.connect(
-            host=self.pg_config['host'],
-            database=self.pg_config['database'],
-            user=self.pg_config['user'],
-            password=self.pg_config['password'],
-            port=self.pg_config.get('port', 5432)
-        )
-        return conn
+    def load_settings(self):
+        """Загрузка параметров LM Studio из config.json проекта"""
+        if not os.path.exists(self.config_path):
+            self.api_url = "http://172.21.0"
+            self.model_name = "qwen2.5-coder-7b-instruct"
+            return
+            
+        with open(self.config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        llm_sec = data.get("local_llm", {})
+        self.api_url = llm_sec.get("api_url", "http://172.21.0").rstrip('/')
+        self.model_name = llm_sec.get("model_name", "qwen2.5-coder-7b-instruct")
+        self.timeout = llm_sec.get("timeout", 120)
 
-    def get_object_context(self, internal_name):
+    def classify_error_and_get_prompt(self, error_text: str) -> str:
         """
-        Вытаскивает из СУБД полный контекст объекта: его BSL-код и реквизиты.
+        Алгоритм ветвления проблемы. Анализирует стек ошибки 
+        и подсовывает модели Qwen специализированный системный промпт.
         """
-        conn = self._get_db_connection()
-        context = {"name": internal_name, "fields": [], "code_modules": []}
+        err_lower = error_text.lower()
 
-        with conn.cursor() as cursor:
-            # 1. Получаем object_id по русскому имени
-            cursor.execute("""
-                SELECT object_id FROM ai_metadata_objects 
-                WHERE internal_name = %s LIMIT 1;
-            """, (internal_name,))
-            row = cursor.fetchone()
-            if not row:
-                conn.close()
-                return None
-            obj_id = row[0]
+        # Ветка 1: Ошибка объектного типа (Null Pointer)
+        if "значение не является значением объектного типа" in err_lower or "неопределено" in err_lower:
+            return (
+                "Ты — эксперт по оптимизации BSL кода 1С:ERP. Обнаружена ошибка обращения к пустому объекту. "
+                "Проанализируй переданный BSL-код и стек ошибки. Найди переменную, которая вызывает сбой. "
+                "Сгенерируй хотфикс: добавь строгую проверку 'ЗначениеЗаполнено()' или 'Если ... <> Неопределено Тогда'. "
+                "В ответе выведи ТОЛЬКО готовый исправленный фрагмент кода BSL без лишних пояснений."
+            )
 
-            # 2. Вытаскиваем все реквизиты объекта
-            cursor.execute("""
-                SELECT field_name, field_type FROM ai_metadata_fields 
-                WHERE object_id = %s;
-            """, (obj_id,))
-            context["fields"] = cursor.fetchall()
+        # Ветка 2: Выход за границы массива
+        if "индекс находится за пределами границы" in err_lower or "массив" in err_lower:
+            return (
+                "Ты — эксперт по разработке на BSL 1С. Обнаружен выход за границы индекса коллекции (Массив/Структура/ТаблицаЗначений). "
+                "Изучи переданный BSL-код. Добавь проверку на количество элементов '.Количество()' перед обращением по индексу. "
+                "В ответе верни ИСКЛЮЧИТЕЛЬНО готовый исправленный блок кода BSL."
+            )
 
-            # 3. Вытаскиваем все тексты BSL-кода (ObjectModule, ManagerModule)
-            cursor.execute("""
-                SELECT module_type, bsl_text FROM ai_source_codes 
-                WHERE object_id = %s;
-            """, (obj_id,))
-            context["code_modules"] = cursor.fetchall()
+        # Ветка 3: Блокировки СУБД и транзакции
+        if "блокировка" in err_lower or "deadlock" in err_lower or "конфликт" in err_lower:
+            return (
+                "Ты — senior 1С-архитектор. Произошел транзакционный конфликт или взаимоблокировка в СУБД PostgreSQL. "
+                "Проанализируй код модуля. Предложи расстановку Управляемых Блокировок ('БлокировкаДанных') или "
+                "оптимизацию запроса для уменьшения времени транзакции. Выведи патч кода."
+            )
 
-        conn.close()
-        return context
-
-    def analyze_bsl_module(self, object_name):
-        """
-        Формирует промпт из контекста СУБД и отправляет его в локальную Qwen
-        """
-        context = self.get_object_context(object_name)
-        if not context or not context["code_modules"]:
-            return f"❌ Объект '{object_name}' или его BSL-код не найдены в базе данных ИИ."
-
-        # Формируем текстовое описание реквизитов для ИИ
-        fields_str = "\n".join([f" - {name} (Тип: {ftype})" for name, ftype in context["fields"]])
-        if not fields_str:
-            fields_str = " Реквизиты отсутствуют или не заданы."
-
-        # Берём первый найденный модуль (например, Модуль объекта)
-        module_type, bsl_text = context["code_modules"][0]
-
-        # Системная инструкция для Qwen2.5-Coder (настраиваем модель на 1С статанализ)
-        system_prompt = (
-            "Ты — ведущий эксперт по разработке и оптимизации на платформе 1С:Предприятие 8.3. "
-            "Твоя задача — проводить статический анализ BSL-кода, искать скрытые баги, "
-            "уязвимости, неоптимальные запросы в циклах и предлагать рефакторинг по стандартам 1С. "
-            "Отвечай строго на русском языке, лаконично, с примерами исправленного кода."
+        # Ветка 4: Дефолтный промпт для всех остальных ошибок
+        return (
+            "Ты — встроенный ИИ-ассистент в IDE для 1С:ERP. Твоя задача — исправить баг рантайма. "
+            "Изучи предоставленный текст ошибки и исходный код BSL модуля. Сгенерируй точечное исправление (hotfix). "
+            "Выведи только исправленный код BSL в формате plain text."
         )
 
-        # Конструируем пользовательский промпт, скармливая модели весь наш собранный SQL-контекст
-        user_prompt = f"""
-Проанализируй код модуля объекта 1С. 
+    def analyze_and_fix_code(self, error_logs: str, current_bsl_code: str) -> dict:
+        """
+        Отправляет структурированный JSON-запрос в локальную LM Studio.
+        Реализует двухконтурную сборку контекста.
+        """
+        # 1. Получаем системный промпт через ветвление проблем
+        system_prompt = self.classify_error_and_get_prompt(error_logs)
+        
+        # 2. Формируем пользовательский контент (User Prompt)
+        user_content = (
+            f"=== СТЕК ОШИБКИ ИЗ РАНТАЙМА 1С ===\n{error_logs}\n\n"
+            f"=== ИСХОДНЫЙ BSL КОД МОДУЛЯ ===\n{current_bsl_code}\n\n"
+            f"Инструкция: Найди ошибку и выдай исправленный BSL-код."
+        )
 
-КОНТЕКСТ ОБЪЕКТА МЕТАДАННЫХ:
-Имя объекта: {object_name}
-Доступные реквизиты/поля в СУБД:
-{fields_str}
-
-ТИП МОДУЛЯ: {module_type}
-ИХОДНЫЙ BSL-КОД ДЛЯ АНАЛИЗА:
-```bsl
-{bsl_text}
-```
-
-Найди критические ошибки, потенциальные падения (например, обращение к пустой ссылке) или неоптимальные конструкции. Выведи список замечаний и покажи улучшенную версию кода.
-"""
-
-        # Формируем стандартный JSON-пакет для OpenAI-совместимого API LM Studio
+        # 3. Сборка стандартного OpenAI-совместимого payload
         payload = {
-            "model": self.llm_model,
+            "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_content}
             ],
-            "temperature": 0.2, # Низкая температура для строгих и точных ответов по коду
-            "max_tokens": 2048
+            "temperature": 0.2, # Низкая температура для строгой генерации кода без фантазий
+            "stream": False
         }
 
-        print(f"🧠 Отправка контекста '{object_name}' в локальную LLM ({self.llm_model})...")
+        endpoint = f"{self.api_url}/chat/completions"
+        print(f"[INFO] [LLM] Отправка запроса к локальной модели {self.model_name}...")
         
         try:
-            # Делаем HTTP POST запрос к локальной нейросети
-            response = requests.post(f"{self.llm_url}/chat/completions", json=payload, timeout=90)
-            response.raise_for_status()
-            result_json = response.json()
-            return result_json['choices'][0]['message']['content']
+            response = requests.post(endpoint, json=payload, timeout=self.timeout)
+            if response.status_code == 200:
+                result_json = response.json()
+                # Безопасно вытягиваем ответ согласно структуре Chat Completion API
+                # (Исправляет баг 'list indices must be integers or slices, not str')
+                ai_reply = result_json["choices"][0]["message"]["content"]
+                return {"status": "SUCCESS", "reply": ai_reply}
+            else:
+                return {
+                    "status": "ERROR", 
+                    "reply": f"Ошибка сервера LM Studio (Код: {response.status_code}): {response.text}"
+                }
+        except requests.exceptions.Timeout:
+            return {"status": "ERROR", "reply": f"Превышен таймаут ожидания локального ИИ ({self.timeout} сек)."}
         except Exception as e:
-            return f"❌ Ошибка взаимодействия с локальной LLM: {e}"
+            return {"status": "ERROR", "reply": f"Не удалось связаться с инференс-сервером: {e}"}
