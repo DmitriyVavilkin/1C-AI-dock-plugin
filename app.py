@@ -378,6 +378,40 @@ class MainAiIdeWindow(QMainWindow):
         color = color_map.get(log_type, "#d4d4d4")
         self.terminal_console.append(f'<span style="color: {color};">[{log_type}]</span> {message}')
 
+    # Пример интеграции в класс вашего главного окна или ИИ-панели
+def init_ai_connections(self):
+    # Кнопка в блоке аналитики OCR-ошибок
+    self.ui.btn_send_to_ai.clicked.connect(self.handle_ocr_error_analysis)
+    
+    # Кнопка контекстного меню или панели BslCodeEditor
+    self.ui.btn_explain_selected.clicked.connect(self.handle_explain_selection)
+
+def handle_ocr_error_analysis(self):
+    """Берет текст из блока ошибок (OCR), отправляет в оркестратор и выводит в панель ответов"""
+    error_text = self.ui.txt_ocr_errors.toPlainText()
+    if not error_text.strip():
+        self.ui.txt_ai_responses.append("⚠️ Ошибка: Поле OCR пустое. Захватите ошибку (Ctrl+Shift+X).")
+        return
+        
+    self.ui.txt_ai_responses.append("🤖 [ИИ] Анализирую контекст ошибки...")
+    
+    # Вызов вашего оркестратора (запуск в потоке QThread, чтобы UI не фризился!)
+    # Результат направляем в self.ui.txt_ai_responses
+
+def handle_explain_selection(self):
+    """Вырезка выделенного BSL-кода с сохранением контекста"""
+    cursor = self.ui.bsl_editor.textCursor()
+    selected_code = cursor.selectedText() # Обратите внимание: PyQt/PySide заменяет \n на \u2029 в selectedText()
+    selected_code = selected_code.replace('\u2029', '\n')
+    
+    if not selected_code.strip():
+        self.ui.txt_ai_responses.append("⚠️ Выделите фрагмент BSL-кода для анализа.")
+        return
+        
+    self.ui.txt_ai_responses.append("🔬 [ИИ] Объясняю выделенный фрагмент кода...")
+    # Отправка selected_code в ai_orchestrator с промптом типа "EXPLAIN_CODE"
+    
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainAiIdeWindow()
