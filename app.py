@@ -57,7 +57,7 @@ class ConfigLoader:
                     "user": "postgres", "password": "", "port": 5432
                 },
                 "local_llm": {
-                    "api_url": "http://172.21.0",
+                    "api_url": "http://172.21.0.179",
                     "model_name": "qwen2.5-coder-7b-instruct",
                     "timeout": 120
                 },
@@ -81,15 +81,13 @@ class TreeLoaderWorker(QThread):
         self.db_config = db_config
 
     def run(self):
-        
-                # Обновленный скоростной запрос для TreeLoaderWorker в app.py
+        # Обновленный скоростной запрос для TreeLoaderWorker
+                # Измененный запрос: выводим Человеческое Имя объекта в UI вместо UUID
         query_modules = """
             SELECT 
                 obj.object_type AS parent_type,
-                -- Выводим синоним категории (например, Общие модули) для читаемости в UI
-                COALESCE(obj.synonym, 'Служебные модули') AS object_sys_name,
-                -- Выводим очищенный UUID как имя объекта метаданных
-                obj.internal_name AS object_rus_name,
+                COALESCE(obj.synonym, obj.internal_name, 'Служебные модули') AS object_sys_name,
+                COALESCE(obj.internal_name, 'Без имени') AS object_rus_name,
                 CASE 
                     WHEN src.module_type = 'МодульМенеджера' THEN 'Модуль менеджера'
                     WHEN src.module_type = 'ОбщийМодуль' THEN 'Общий модуль'
@@ -100,7 +98,6 @@ class TreeLoaderWorker(QThread):
             INNER JOIN ai_metadata_objects obj ON src.resolved_object_id = obj.object_id::uuid
             ORDER BY parent_type, object_sys_name;
         """
-
         try:
             conn = psycopg2.connect(**self.db_config)
             with conn.cursor() as cursor:
@@ -127,8 +124,6 @@ class TreeLoaderWorker(QThread):
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
-
-
 class BslCodeEditor(QPlainTextEdit):
     """Текстовый редактор для 1С (BSL) с сохранением топологии строк 1С"""
     def __init__(self, parent=None):
@@ -141,23 +136,34 @@ class BslCodeEditor(QPlainTextEdit):
         self.xml_pattern = re.compile(r'<([^>]+)>', re.DOTALL)
         self.meta_header_pattern = re.compile(r'\{7fffffff,.*?\}', re.DOTALL)
 
+    
     def set_clean_bsl_text(self, raw_text: str):
         if not raw_text:
             self.setPlainText("")
             return
+            
+        # 1. Вычищаем нулевые байты
         cleaned_text = raw_text.replace('\x00', '')
         
+        # 2. Агрессивный паттерн для удаления заголовков структуры 1С (включая hex-адреса и 7fffffff)
+        # Находит строки вида "00000020 00000020 7fffffff" и текстовые маркеры структуры
+        v8_hex_garbage_pattern = re.compile(
+            r'(^[0-9a-fA-F]{8}\s+[0-9a-fA-F]{8}\s+7fffffff.*$|^\s*7fffffff,.*$)', 
+            re.MULTILINE | re.IGNORECASE
+        )
+        cleaned_text = v8_hex_garbage_pattern.sub('', cleaned_text)
+        
+        # 3. Сохраняем топологию строк для XML и оставшихся мета-заголовков платформы
         def preserve_lines_replacer(match):
             return '\n' * match.group(0).count('\n')
 
         if "<schema" in cleaned_text or "<?xml" in cleaned_text:
             cleaned_text = self.xml_pattern.sub(preserve_lines_replacer, cleaned_text)
-        cleaned_text = self.meta_header_pattern.sub(preserve_lines_replacer, cleaned_text)
-        
-        self.setPlainText(cleaned_text)
+            
+        self.setPlainText(cleaned_text.strip())
 
-    def get_dirty_runtime_code(self) -> str:
-        return self.toPlainText()
+    
+
 class MainAiIdeWindow(QMainWindow):
     """Главное окно IDE с консолью во всю ширину и трехблочным ИИ-центром"""
     def __init__(self):
@@ -198,7 +204,6 @@ class MainAiIdeWindow(QMainWindow):
 
         self._init_ui()
         self.start_async_tree_loading() # Автозапуск построения дерева при инициализации окна
-    
     def _init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -303,13 +308,13 @@ class MainAiIdeWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar(self))
         self.log_terminal("SUCCESS", "Геометрия интерфейса и ИИ-панели полностью обновлены.")
+
     def log_terminal(self, log_type: str, message: str):
         """Вывод статусных логов проекта в нижнюю консоль с вашими цветами"""
         color_map = {"INFO": "#007acc", "SUCCESS": "#4ec9b0", "ERROR": "#f44336", "WARN": "#fd971f"}
         color = color_map.get(log_type, "#d4d4d4")
         log_line = f'<span style="color: {color};">[{log_type}]</span> {message}'
         self.terminal_console.append(log_line)
-
     def trigger_screen_ocr(self):
         """Вызов внешнего OCR модуля захвата экрана ошибки рантайма 1С"""
         self.log_terminal("INFO", "Снят снимок активного окна. Запуск Tesseract OCR...")
@@ -319,6 +324,7 @@ class MainAiIdeWindow(QMainWindow):
             self.error_chat_panel.setPlainText(extracted_error_text)
             self.log_terminal("SUCCESS", "Текст ошибки рантайма успешно извлечен и помещен в буфер ИИ.")
         except Exception as e:
+            self.error_chat_panel.setPlaceholderText("Сюда упадет текст ошибки после нажатия хоткея...")
             self.log_terminal("ERROR", f"Сбой подсистемы OCR: {str(e)}")
 
     def handle_ocr_error_analysis(self):
@@ -349,6 +355,7 @@ class MainAiIdeWindow(QMainWindow):
         cursor = self.code_editor.textCursor()
         selected_text = cursor.selectedText()
         
+        # Корректная обработка разделителей строк Qt (\u2029) для локальных LLM
         selected_text = selected_text.replace('\u2029', '\n').strip()
         
         if not selected_text:
@@ -376,7 +383,7 @@ class MainAiIdeWindow(QMainWindow):
         self.log_terminal("ERROR", f"Сбой LM Studio / Оркестратора: {error_msg}")
 
     def start_async_tree_loading(self):
-        """Запуск фонового поока для безопасного построения дерева объектов"""
+        """Запуск фонового потока для безопасного построения дерева объектов"""
         self.log_terminal("INFO", "Запуск асинхронного сканирования таблиц метаданных...")
         self.btn_load_tree.setEnabled(False)
         self.tree_model.clear()

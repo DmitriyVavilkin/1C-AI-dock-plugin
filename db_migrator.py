@@ -96,17 +96,31 @@ class DbMigratorEngine:
                 print("[INFO] Сброс старого кэша связей в базе ИИ...")
                 cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
 
-                # 2. Создаем скоростные индексы для связи UUID
+                # 2. Создаем скоростные индексы для связи UUID и масок имен
                 print("[INFO] Создание скоростных функциональных индексов СУБД...")
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_fast_obj_uuid ON ai_metadata_objects (object_id);
+                    
                     CREATE INDEX IF NOT EXISTS idx_fast_src_clean_uuid ON ai_metadata_source_codes (
                         LOWER(TRIM(split_part(raw_path, '.', 1)))
                     );
+                    
+                    -- СВЕРХБЫСТРЫЕ ФУНКЦИОНАЛЬНЫЕ ИНДЕКСЫ ДЛЯ МЯГКОГО ДОБОРА РАСШИРЕНИЙ
+                    CREATE INDEX IF NOT EXISTS idx_fast_obj_regexp_name ON ai_metadata_objects (
+                        LOWER(REGEXP_REPLACE(internal_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                    );
+                    
+                    CREATE INDEX IF NOT EXISTS idx_fast_obj_regexp_synonym ON ai_metadata_objects (
+                        LOWER(REGEXP_REPLACE(synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                    );
+                    
+                    CREATE INDEX IF NOT EXISTS idx_fast_src_regexp_name ON ai_metadata_source_codes (
+                        LOWER(REGEXP_REPLACE(object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                    ) WHERE resolved_object_id IS NULL;
                 """)
 
                 print("[INFO] Запуск точной пакетной увязки ERP по бинарным UUID...")
-                # Явное приведение типов через ::uuid добавлено в строку SET resolved_object_id
+                # Исправлено: Явный каст к ::uuid в SET, безопасное текстовое сравнение в WHERE
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes src
                     SET resolved_object_id = obj.object_id::uuid,
@@ -116,15 +130,15 @@ class DbMigratorEngine:
                             ELSE 'МодульОбъекта'
                         END
                     FROM ai_metadata_objects obj
-                    WHERE obj.object_id::text = LOWER(TRIM(split_part(src.raw_path, '.', 1)))
-                      AND obj.object_id::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+                    WHERE split_part(src.raw_path, '.', 1) ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+                      AND obj.object_id::text = LOWER(TRIM(split_part(src.raw_path, '.', 1)));
                 """)
                 step1 = cursor.rowcount
                 print(f"[SUCCESS] Прямым сопоставлением UUID успешно увязано модулей: {step1}")
 
                 # 3. Интеллектуальный мягкий добор для расширений и форм по именам/синонимам
-                print("[INFO] Мягкий добор оставшихся кастомных объектов и расширений...")
-                # Сюда также добавлено явное приведение типов ::uuid
+                print("[INFO] Мягкий добор оставшихся кастомных объектов и расширений по функциональным индексам...")
+                # Исправлено: Добавлен каст ::uuid для защиты от пересортицы типов
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes src
                     SET resolved_object_id = obj.object_id::uuid,
@@ -134,10 +148,10 @@ class DbMigratorEngine:
                         END
                     FROM ai_metadata_objects obj
                     WHERE src.resolved_object_id IS NULL
-                      AND obj.object_id::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
                       AND (
                         LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.internal_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                        OR LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
+                        OR 
+                        LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
                       );
                 """)
                 step2 = cursor.rowcount
@@ -161,7 +175,6 @@ class DbMigratorEngine:
             if conn_ai: conn_ai.rollback()
         finally:
             if conn_ai: conn_ai.close()
-
 
 
 if __name__ == "__main__":
