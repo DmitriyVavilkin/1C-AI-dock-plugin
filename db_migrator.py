@@ -73,59 +73,141 @@ class DbMigratorEngine:
         return hash_to_uuid
 
     def execute_migration(self):
-        """Шаг 2: Массовая реконсиляция, создание таблиц и жесткая увязка метаданных по UUID"""
+        """Шаг 2: Структурная миграция СУБД на основе Class ID платформы 1С без текстового поиска"""
         print(f"[INFO] Подключение к ИИ-хранилищу {self.config_ai.get('dbname')}...")
         conn_ai = None
+        conn_1c = None
         try:
             conn_ai = psycopg2.connect(**self.config_ai)
+            conn_1c = psycopg2.connect(**self.config_1c)
+            
+            # Канонические внутренние Class ID платформы 1С:Предприятие
+            v8_classes = {
+                "9cd510cd-abfc-11d4-9434-004095e12fc7": "commonmodule",
+                "cf4dbf0f-decc-11d4-9423-004095e12fc7": "catalog",
+                "13134201-f60b-11d4-9434-004095e12fc7": "document",
+                "b1a160d5-14f7-11d5-a4b5-00c0df0a416a": "informationregister",
+                "9399bfd0-f203-11d4-9434-004095e12fc7": "accumulationregister",
+                "01026040-5e36-11d5-a4b5-00c0df0a416a": "report",
+                "bf75a1c0-aa51-11d4-9434-004095e12fc7": "dataprocessor",
+                "61ff1b61-a0da-11d4-9434-004095e12fc7": "constant",
+                "62c97df1-a0ea-11d4-9434-004095e12fc7": "enum",
+                "459f3231-ab10-11d4-9434-004095e12fc7": "documentjournal",
+                "37f694e1-229d-11d5-a4b5-00c0df0a416a": "webservice",
+                "ba061551-7f98-4d51-85e7-a9a77ef769d4": "httpservice"
+            }
+
+            print("[INFO] Чтение структурных манифестов конфигурации 1С...")
+            metadata_map = {} # {uuid: {"name": имя, "type": класс, "parent": parent_uuid}}
+            
+            with conn_1c.cursor() as cursor_1c:
+                cursor_1c.execute("SELECT filename, binarydata FROM config WHERE filename IN ('config', 'root');")
+                for filename, binarydata in cursor_1c.fetchall():
+                    text_content = self._decompress_v8_zlib(bytes(binarydata))
+                    if not text_content: continue
+                    
+                    # Извлекаем блоки описания метаданных платформы
+                    # Ищем строки вида: c695a452-9598-... (UUID класса) и его элементы
+                    for class_uuid, class_type in v8_classes.items():
+                        # Ищем все UUID объектов, принадлежащих данному классу метаданных
+                        found_uuids = re.findall(r'\"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\"', text_content)
+                        for f_uuid in found_uuids:
+                            f_uuid_lower = f_uuid.lower()
+                            if f_uuid_lower not in metadata_map:
+                                metadata_map[f_uuid_lower] = {
+                                    "name": f"Объект_{f_uuid[:8]}", 
+                                    "type": class_type, 
+                                    "parent": None
+                                }
+
+            print("[INFO] Глубокое обогащение имен и выявление подчиненных форм справочников/документов...")
+            with conn_1c.cursor() as cursor_1c:
+                cursor_1c.execute("""
+                    SELECT filename, binarydata 
+                    FROM config 
+                    WHERE length(binarydata) > 100 
+                      AND filename ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+                """)
+                for filename, binarydata in cursor_1c.fetchall():
+                    f_uuid = filename.lower()
+                    text_content = self._decompress_v8_zlib(bytes(binarydata))
+                    if not text_content: continue
+                    
+                    # Извлекаем каноничное имя объекта
+                    name_match = re.search(r'\"([А-Яа-яA-Za-z0-9_]{3,60})\"', text_content)
+                    if name_match:
+                        obj_name = name_match.group(1)
+                        if obj_name.lower() in ['checkedout', 'version', 'root', 'data']: continue
+                        
+                        if f_uuid in metadata_map:
+                            metadata_map[f_uuid]["name"] = obj_name
+                        else:
+                            # Если файла нет в корне, но это форма или подчиненный элемент
+                            # Ищем связь с родительским UUID, которая зашита во внутренних файлах 1С
+                            parent_match = re.search(r'\"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\"', text_content)
+                            parent_uuid = parent_match.group(1).lower() if parent_match else None
+                            
+                            # По умолчанию относим к "Прочим объектам", если класс не определен жестко
+                            metadata_map[f_uuid] = {
+                                "name": obj_name,
+                                "type": "unknown",
+                                "parent": parent_uuid
+                            }
+
             with conn_ai.cursor() as cursor:
-                # 1. Инициализируем структуру таблиц
+                print("[INFO] Пересоздание реляционной схемы таблиц метаданных СУБД...")
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS ai_metadata_objects (
+                    DROP TABLE IF EXISTS v8_metadata_map CASCADE;
+                    DROP TABLE IF EXISTS ai_metadata_objects CASCADE;
+                    
+                    -- Новая эталонная таблица объектов метаданных с поддержкой ИЕРАРХИИ платформ
+                    CREATE TABLE ai_metadata_objects (
                         object_id UUID PRIMARY KEY,
-                        object_type VARCHAR(50),
+                        object_type VARCHAR(100),
                         internal_name VARCHAR(255),
                         synonym VARCHAR(255),
-                        is_extension BOOLEAN DEFAULT FALSE
+                        parent_object_id UUID, -- Явное поле связи "Форма -> Справочник-Владелец"
+                        config_scope VARCHAR(100) DEFAULT 'Main Configuration'
                     );
-                    ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS resolved_object_id UUID;
-                    ALTER TABLE ai_metadata_source_codes ADD COLUMN IF NOT EXISTS module_type VARCHAR(50);
-                    ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type DROP NOT NULL;
+                    
+                    CREATE TABLE v8_metadata_map (
+                        object_id UUID PRIMARY KEY,
+                        human_name VARCHAR(255),
+                        object_type VARCHAR(100),
+                        parent_object_id UUID,
+                        config_scope VARCHAR(100) DEFAULT 'Main Configuration'
+                    );
                 """)
                 
-                print("[INFO] Сброс старого кэша связей в базе ИИ...")
-                cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
+                # Заливаем чистые реляционные данные
+                if metadata_map:
+                    print(f"[INFO] Сохранение {len(metadata_map)} реляционных объектов в СУБД...")
+                    insert_query = """
+                        INSERT INTO v8_metadata_map (object_id, human_name, object_type, parent_object_id, config_scope)
+                        VALUES %s;
+                    """
+                    records = [(uid, info["name"], info["type"], info["parent"], info["scope"]) for uid, info in metadata_map.items()]
+                    execute_values(cursor, insert_query, records)
 
-                # 2. Создаем скоростные индексы для связи UUID и масок имен
-                print("[INFO] Создание скоростных функциональных индексов СУБД...")
+                print("[INFO] Перенос структуры в основную таблицу ai_metadata_objects...")
                 cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_fast_obj_uuid ON ai_metadata_objects (object_id);
-                    
-                    CREATE INDEX IF NOT EXISTS idx_fast_src_clean_uuid ON ai_metadata_source_codes (
-                        LOWER(TRIM(split_part(raw_path, '.', 1)))
-                    );
-                    
-                    -- СВЕРХБЫСТРЫЕ ФУНКЦИОНАЛЬНЫЕ ИНДЕКСЫ ДЛЯ МЯГКОГО ДОБОРА РАСШИРЕНИЙ
-                    CREATE INDEX IF NOT EXISTS idx_fast_obj_regexp_name ON ai_metadata_objects (
-                        LOWER(REGEXP_REPLACE(internal_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                    );
-                    
-                    CREATE INDEX IF NOT EXISTS idx_fast_obj_regexp_synonym ON ai_metadata_objects (
-                        LOWER(REGEXP_REPLACE(synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                    );
-                    
-                    CREATE INDEX IF NOT EXISTS idx_fast_src_regexp_name ON ai_metadata_source_codes (
-                        LOWER(REGEXP_REPLACE(object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                    ) WHERE resolved_object_id IS NULL;
+                    INSERT INTO ai_metadata_objects (object_id, object_type, internal_name, parent_object_id)
+                    SELECT object_id, object_type, human_name, parent_object_id FROM v8_metadata_map
+                    ON CONFLICT (object_id) DO UPDATE 
+                    SET object_type = EXCLUDED.object_type,
+                        internal_name = EXCLUDED.internal_name,
+                        parent_object_id = EXCLUDED.parent_object_id;
                 """)
 
-                print("[INFO] Запуск точной пакетной увязки ERP по бинарным UUID...")
-                # Исправлено: Явный каст к ::uuid в SET, безопасное текстовое сравнение в WHERE
+                print("[INFO] Сброс кэша связей модулей...")
+                cursor.execute("UPDATE ai_metadata_source_codes SET resolved_object_id = NULL, module_type = NULL;")
+                
+                print("[INFO] Пакетная увязка модулей по UUID...")
                 cursor.execute("""
                     UPDATE ai_metadata_source_codes src
                     SET resolved_object_id = obj.object_id::uuid,
                         module_type = CASE 
-                            WHEN obj.object_type = 'CommonModule' THEN 'ОбщийМодуль'
+                            WHEN LOWER(obj.object_type) = 'commonmodule' THEN 'ОбщийМодуль'
                             WHEN src.object_name ILIKE '%Менеджер%' OR src.object_name ILIKE '%.1' THEN 'МодульМенеджера'
                             ELSE 'МодульОбъекта'
                         END
@@ -133,49 +215,16 @@ class DbMigratorEngine:
                     WHERE split_part(src.raw_path, '.', 1) ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
                       AND obj.object_id::text = LOWER(TRIM(split_part(src.raw_path, '.', 1)));
                 """)
-                step1 = cursor.rowcount
-                print(f"[SUCCESS] Прямым сопоставлением UUID успешно увязано модулей: {step1}")
-
-                # 3. Интеллектуальный мягкий добор для расширений и форм по именам/синонимам
-                print("[INFO] Мягкий добор оставшихся кастомных объектов и расширений по функциональным индексам...")
-                # Исправлено: Добавлен каст ::uuid для защиты от пересортицы типов
-                cursor.execute("""
-                    UPDATE ai_metadata_source_codes src
-                    SET resolved_object_id = obj.object_id::uuid,
-                        module_type = CASE 
-                            WHEN obj.object_type = 'CommonModule' THEN 'ОбщийМодуль'
-                            ELSE 'МодульОбъекта'
-                        END
-                    FROM ai_metadata_objects obj
-                    WHERE src.resolved_object_id IS NULL
-                      AND (
-                        LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.internal_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                        OR 
-                        LOWER(REGEXP_REPLACE(src.object_name, '[^а-яА-Яa-zA-Z0-9_]', '', 'g')) = LOWER(REGEXP_REPLACE(obj.synonym, '[^а-яА-Яa-zA-Z0-9_]', '', 'g'))
-                      );
-                """)
-                step2 = cursor.rowcount
-                print(f"[SUCCESS] Дополнительно привязано объектов расширений: {step2}")
-
-                # 4. Изолируем служебные файлы платформы
-                print("[INFO] Закрытие контура служебных файлов платформы...")
-                cursor.execute("""
-                    UPDATE ai_metadata_source_codes 
-                    SET module_type = 'СистемныйМодуль' 
-                    WHERE resolved_object_id IS NULL;
-                    
-                    ALTER TABLE ai_metadata_source_codes ALTER COLUMN module_type SET NOT NULL;
-                """)
                 
                 conn_ai.commit()
-                print(f"[SUCCESS] Миграция ERP завершена! Всего связано: {step1 + step2} модулей.")
+                print(f"[SUCCESS] Иерархическая миграция метаданных 1С:ERP завершена!")
                 
         except Exception as e:
             print(f"[ERROR] Критический сбой миграции БД: {e}")
             if conn_ai: conn_ai.rollback()
         finally:
+            if conn_1c: conn_1c.close()
             if conn_ai: conn_ai.close()
-
 
 if __name__ == "__main__":
     migrator = DbMigratorEngine()

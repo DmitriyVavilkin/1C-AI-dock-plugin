@@ -81,37 +81,64 @@ class TreeLoaderWorker(QThread):
         self.db_config = db_config
 
     def run(self):
-        # Обновленный скоростной запрос для TreeLoaderWorker
-                # Измененный запрос: выводим Человеческое Имя объекта в UI вместо UUID
+        # 1. Заранее объявляем эталонный структурный SQL-запрос для исключения ошибок UnboundLocalError
         query_modules = """
             SELECT 
-                obj.object_type AS parent_type,
-                COALESCE(obj.synonym, obj.internal_name, 'Служебные модули') AS object_sys_name,
+                -- Вычисляем жесткий тип папки Конфигуратора на основе родителя или самого объекта
+                COALESCE(parent_obj.object_type, obj.object_type, 'unknown') AS parent_type,
+                -- UUID самого объекта (или подчиненной формы)
+                obj.internal_name AS object_sys_name,
+                -- Имя самого объекта (например, 'ФормаПечати' или 'АвансовыйОтчет')
                 COALESCE(obj.internal_name, 'Без имени') AS object_rus_name,
                 CASE 
                     WHEN src.module_type = 'МодульМенеджера' THEN 'Модуль менеджера'
                     WHEN src.module_type = 'ОбщийМодуль' THEN 'Общий модуль'
                     ELSE 'Модуль объекта'
                 END AS module_type_clean,
-                src.id AS file_db_id
+                src.id AS file_db_id,
+                -- Вытаскиваем имя родителя (владельца), если это подчиненная форма/макет
+                parent_obj.internal_name AS parent_object_name
             FROM ai_metadata_source_codes src
             INNER JOIN ai_metadata_objects obj ON src.resolved_object_id = obj.object_id::uuid
-            ORDER BY parent_type, object_sys_name;
+            -- Безопасный каст: Принудительно приводим оба ключа к UUID при связи таблиц
+            LEFT JOIN ai_metadata_objects parent_obj ON obj.parent_object_id::uuid = parent_obj.object_id::uuid
+            ORDER BY parent_type, parent_object_name NULLS FIRST, object_rus_name;
         """
+
+        # 2. Изолированный защитный контур схемы СУБД PostgreSQL
+        try:
+            conn_patch = psycopg2.connect(**self.db_config)
+            with conn_patch.cursor() as patch_cursor:
+                # Добавляем поле иерархии, если его еще нет в СУБД
+                patch_cursor.execute("ALTER TABLE ai_metadata_objects ADD COLUMN IF NOT EXISTS parent_object_id UUID;")
+                # На случай, если поле ранее создалось как VARCHAR, принудительно кастим структуру к UUID
+                patch_cursor.execute("""
+                    ALTER TABLE ai_metadata_objects 
+                    ALTER COLUMN parent_object_id TYPE UUID USING parent_object_id::uuid;
+                """)
+                conn_patch.commit()
+            conn_patch.close()
+        except Exception as e:
+            # Логируем в консоль разработчика, не прерывая выполнение UI-потока
+            print(f"[WARN] Автопатч схемы пропустил изменение типа (поле уже в UUID или СУБД занята): {e}")
+
+        # 3. Основной цикл вычитки чанков данных метаданных
         try:
             conn = psycopg2.connect(**self.db_config)
             with conn.cursor() as cursor:
                 cursor.execute(query_modules)
                 chunk = []
                 counter = 0
-                for parent_type, object_sys_name, object_rus_name, module_type_clean, file_db_id in cursor:
+                for parent_type, object_sys_name, object_rus_name, module_type_clean, file_db_id, parent_object_name in cursor:
                     counter += 1
+                    # Передаем расширенный кортеж из 6 полей в UI-поток
                     chunk.append((
                         str(parent_type) if parent_type else "Unknown",
                         str(object_sys_name),
                         str(object_rus_name),
                         str(module_type_clean),
-                        int(file_db_id)
+                        int(file_db_id),
+                        str(parent_object_name) if parent_object_name else None
                     ))
                     if len(chunk) >= 500:
                         self.chunk_received_signal.emit(chunk)
@@ -124,6 +151,7 @@ class TreeLoaderWorker(QThread):
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
+
 class BslCodeEditor(QPlainTextEdit):
     """Текстовый редактор для 1С (BSL) с сохранением топологии строк 1С"""
     def __init__(self, parent=None):
@@ -403,40 +431,27 @@ class MainAiIdeWindow(QMainWindow):
             lambda err: self.log_terminal("ERROR", f"Сбой структуры: {err}")
         )
         self.worker.start()
+
     def _handle_tree_chunk(self, chunk: list):
-        """Потокобезопасная отрисовка дерева метаданных 1С в главном потоке окна"""
+        """Отрисовка дерева метаданных в строгом трехуровневом стиле Конфигуратора 1С"""
         type_translations = {
-            "commonmodule": "⚙️ Общие модули",
-            "catalog": "📁 Справочники",
-            "document": "📄 Документы",
-            "informationregister": "📋 Регистры сведений",
-            "accumulationregister": "📈 Регистры накопления",
-            "report": "📊 Отчеты",
-            "dataprocessor": "🛠️ Обработки",
-            "constant": "📌 Константы",
-            "enum": "📊 Перечисления",
-            "documentjournal": "📑 Журналы документов",
-            "accountingregister": "🏦 Регистры бухгалтерии",
-            "calculationregister": "🧮 Регистры расчета",
-            "businessprocess": "🌿 Бизнес-процессы",
-            "task": "📅 Задачи",
-            "общиймодуль": "⚙️ Общие модули",
-            "справочник": "📁 Справочники",
-            "документ": "📄 Документы",
-            "регистрсведений": "📋 Регистры сведений",
-            "регистрнакопления": "📈 Регистры накопления"
+            "commonmodule": "⚙️ Общие модули", "catalog": "📁 Справочники",
+            "document": "📄 Документы", "informationregister": "📋 Регистры сведений",
+            "accumulationregister": "📈 Регистры накопления", "report": "📊 Отчеты",
+            "dataprocessor": "🛠️ Обработки", "constant": "📌 Константы",
+            "enum": "📊 Перечисления", "webservice": "🌐 Web-сервисы",
+            "httpservice": "🛸 HTTP-сервисы", "unknown": "📦 Прочие объекты"
         }
 
-        for parent_type_raw, object_sys_name, object_rus_name, module_type_clean, file_db_id in chunk:
-            parent_type_clean = parent_type_raw.strip().lower()
+        # Словарь для быстрого поиска созданных нод объектов верхнего уровня внутри классов
+        # Структура: { "document_АвансовыйОтчет": QStandardItem }
+        if not hasattr(self, 'ui_object_nodes_cache'):
+            self.ui_object_nodes_cache = {}
 
-            if parent_type_clean in ['systemfiles', 'системныефайлы', 'system']:
-                file_label = f"📄 Служебный файл платформы (ID: {file_db_id})"
-                file_item = QStandardItem(file_label)
-                file_item.setData(file_db_id, Qt.ItemDataRole.UserRole)
-                self.service_node.appendRow(file_item)
-                continue
+        for parent_type_raw, object_sys_name, object_rus_name, module_type_clean, file_db_id, parent_object_name in chunk:
+            parent_type_clean = parent_type_raw.strip().lower() if parent_type_raw else "unknown"
 
+            # 1. НАХОДИМ ИЛИ СОЗДАЕМ КОРНЕВУЮ ПАПКУ КЛАССА (Уровень 1: например, "📄 Документы")
             if parent_type_clean not in self.root_nodes:
                 display_type = type_translations.get(parent_type_clean, f"📁 {parent_type_raw}")
                 root_item = QStandardItem(display_type)
@@ -444,49 +459,67 @@ class MainAiIdeWindow(QMainWindow):
                 self.tree_model.appendRow(root_item)
                 self.root_nodes[parent_type_clean] = root_item
                 
-            current_root = self.root_nodes[parent_type_clean]
+            class_root_node = self.root_nodes[parent_type_clean]
 
-            is_report_garbage = (
-                parent_type_clean == "report" and 
-                (len(object_rus_name) > 35 or ":" in object_rus_name or object_rus_name.strip()[:1].isdigit())
-            )
+            # Определяем, к какому объекту верхнего уровня (Владельцу) относится этот модуль
+            owner_object_name = parent_object_name if parent_object_name else object_rus_name
+            object_cache_key = f"{parent_type_clean}_{owner_object_name}"
 
-            if is_report_garbage:
-                object_key = f"{parent_type_clean}_COMPACT_REPORTS_ROOT"
-                display_title = "📊 [Разделы и формы регламентированных отчетов ERP]"
-                module_label = f"📝 {object_rus_name}"
+            # 2. НАХОДИМ ИЛИ СОЗДАЕМ САМ ОБЪЕКТ КОНФИГУРАЦИИ (Уровень 2: например, "📦 АвансовыйОтчет")
+            if object_cache_key not in self.ui_object_nodes_cache:
+                main_obj_node = QStandardItem(f"📦 {owner_object_name}")
+                main_obj_node.setEditable(False)
+                class_root_node.appendRow(main_obj_node)
+                
+                # Создаем контейнеры под формы/макеты и реквизиты, как в настоящей 1С
+                forms_folder = QStandardItem("🖼️ Формы")
+                forms_folder.setSelectable(False)
+                main_obj_node.appendRow(forms_folder)
+                
+                props_folder = QStandardItem("📋 Реквизиты")
+                props_folder.setSelectable(False)
+                main_obj_node.appendRow(props_folder)
+                
+                self.ui_object_nodes_cache[object_cache_key] = {
+                    "main_node": main_obj_node,
+                    "forms_folder": forms_folder,
+                    "modules_cache": {}
+                }
+                
+            obj_cluster = self.ui_object_nodes_cache[object_cache_key]
+            
+            # 3. ОТРИСОВКА ПОДЧИНЕННОЙ СТРУКТУРЫ (Уровень 3: Формы, макеты и их модули)
+            if parent_object_name:
+                # Перед нами подчиненная печатная форма или макет! 
+                # Создаем для нее красивую именованную ноду внутри папки "ФОРМЫ"
+                sub_element_key = f"{object_cache_key}_{object_rus_name}"
+                
+                if sub_element_key not in obj_cluster["modules_cache"]:
+                    sub_node = QStandardItem(f"🖼️ {object_rus_name}")
+                    sub_node.setEditable(False)
+                    obj_cluster["forms_folder"].appendRow(sub_node)
+                    obj_cluster["modules_cache"][sub_element_key] = sub_node
+                
+                target_node = obj_cluster["modules_cache"][sub_element_key]
+                module_label = f"📝 {module_type_clean}"
             else:
-                object_key = f"{parent_type_clean}_{object_sys_name}"
-                display_title = f"📦 {object_rus_name} ({object_sys_name})"
+                # Это собственный модуль объекта/менеджера (лежит в корне объекта)
+                target_node = obj_cluster["main_node"]
                 module_label = f"📝 {module_type_clean}"
 
-            if object_key not in self.object_nodes:
-                obj_node = QStandardItem(display_title)
-                obj_node.setEditable(False)
-                current_root.appendRow(obj_node)
-                
-                if not is_report_garbage:
-                    props_folder = QStandardItem("📋 Реквизиты (Только чтение)")
-                    props_folder.setSelectable(False)
-                    obj_node.appendRow(props_folder)
-                
-                self.object_nodes[object_key] = {"main_node": obj_node, "modules": {}}
-            
-            cached_obj = self.object_nodes[object_key]
-            obj_main_node = cached_obj["main_node"]
-            obj_modules_cache = cached_obj["modules"]
-
-            if is_report_garbage:
-                report_item = QStandardItem(module_label)
-                report_item.setData(file_db_id, Qt.ItemDataRole.UserRole)
-                obj_main_node.appendRow(report_item)
-            else:
-                if module_type_clean not in obj_modules_cache:
-                    module_item = QStandardItem(module_label)
-                    module_item.setEditable(False)
-                    module_item.setData(file_db_id, Qt.ItemDataRole.UserRole)
-                    obj_main_node.appendRow(module_item)
-                    obj_modules_cache[module_type_clean] = module_item
+            # Кладём BSL-код строго внутрь целевой ноды
+            # Проверяем, чтобы модуль не продублировался при чтении чанков
+            module_exists = False
+            for row in range(target_node.rowCount()):
+                if target_node.child(row).text() == module_label:
+                    module_exists = True
+                    break
+                    
+            if not module_exists:
+                module_item = QStandardItem(module_label)
+                module_item.setEditable(False)
+                module_item.setData(file_db_id, Qt.ItemDataRole.UserRole)
+                target_node.appendRow(module_item)
 
         self.tree_view.update()
 
